@@ -41,6 +41,12 @@ class HomePage extends StatelessWidget {
         app.device.firmwareVersion,
       ]),
       builder: (context, _) {
+        final settings = app.settings;
+        final needsToken = settings.authToken.isEmpty;
+        final needsDevice =
+            settings.pairedBleId == null || settings.pairedBleId!.isEmpty;
+        final needsSetup = needsToken || needsDevice;
+
         return Scaffold(
           appBar: AppBar(
             title: const Text('Locket'),
@@ -57,7 +63,14 @@ class HomePage extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  _StatusCard(app: app),
+                  if (needsSetup)
+                    _SetupCard(
+                      needsToken: needsToken,
+                      needsDevice: needsDevice,
+                      onOpenSettings: () => _openSettings(context),
+                    )
+                  else
+                    _StatusCard(app: app),
                   const SizedBox(height: 16),
                   _InfoRow(app: app),
                   const SizedBox(height: 16),
@@ -69,11 +82,13 @@ class HomePage extends StatelessWidget {
               ),
             ),
           ),
-          floatingActionButton: FloatingActionButton.extended(
-            onPressed: () => _toggle(context),
-            icon: Icon(app.running ? Icons.stop : Icons.play_arrow),
-            label: Text(app.running ? '停止' : '開始'),
-          ),
+          floatingActionButton: needsSetup
+              ? null
+              : FloatingActionButton.extended(
+                  onPressed: () => _toggle(context),
+                  icon: Icon(app.running ? Icons.stop : Icons.play_arrow),
+                  label: Text(app.running ? '停止' : '開始'),
+                ),
         );
       },
     );
@@ -270,6 +285,78 @@ class _TranscriptList extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+class _SetupCard extends StatelessWidget {
+  final bool needsToken;
+  final bool needsDevice;
+  final VoidCallback onOpenSettings;
+  const _SetupCard({
+    required this.needsToken,
+    required this.needsDevice,
+    required this.onOpenSettings,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Card(
+      color: scheme.primaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.info_outline, color: scheme.onPrimaryContainer),
+                const SizedBox(width: 8),
+                Text(
+                  'セットアップが必要です',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        color: scheme.onPrimaryContainer,
+                      ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            if (needsToken)
+              _SetupStep(
+                color: scheme.onPrimaryContainer,
+                text: '1. サーバーの認証トークンを入力',
+              ),
+            if (needsDevice)
+              _SetupStep(
+                color: scheme.onPrimaryContainer,
+                text: needsToken
+                    ? '2. Omi CV1 をスキャンしてペアリング'
+                    : '1. Omi CV1 をスキャンしてペアリング',
+              ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: onOpenSettings,
+              icon: const Icon(Icons.settings),
+              label: const Text('設定を開く'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SetupStep extends StatelessWidget {
+  final Color color;
+  final String text;
+  const _SetupStep({required this.color, required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Text(text, style: TextStyle(color: color)),
     );
   }
 }

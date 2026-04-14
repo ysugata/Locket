@@ -64,10 +64,10 @@ class OmiDeviceService extends ChangeNotifier {
   bool _disposed = false;
 
   Future<bool> _requestPermissions() async {
-    if (Platform.isIOS) {
-      final status = await Permission.bluetooth.request();
-      return status.isGranted || status.isLimited;
-    }
+    // iOS: permission_handler's Permission.bluetooth is unreliable on
+    // iOS 13+ — the actual system prompt is triggered by Core Bluetooth
+    // itself when scanning starts, keyed on NSBluetoothAlwaysUsageDescription
+    // in Info.plist. Let flutter_blue_plus handle it natively.
     if (Platform.isAndroid) {
       final results = await [
         Permission.bluetoothScan,
@@ -85,11 +85,34 @@ class OmiDeviceService extends ChangeNotifier {
   }) async {
     final supported = await FlutterBluePlus.isSupported;
     if (!supported) {
-      throw StateError('BLE is not supported on this device');
+      throw StateError('このデバイスは BLE をサポートしていません');
     }
     final granted = await _requestPermissions();
     if (!granted) {
-      throw StateError('BLE permissions were not granted');
+      throw StateError('BLE の権限が許可されていません');
+    }
+
+    // Read adapter state. On iOS this also forces the CBCentralManager
+    // to initialize, which triggers the system permission prompt the
+    // first time the app runs. After that, a non-`on` state is mapped
+    // to a user-friendly Japanese message.
+    final state = await FlutterBluePlus.adapterState
+        .firstWhere((s) => s != BluetoothAdapterState.unknown)
+        .timeout(const Duration(seconds: 5),
+            onTimeout: () => BluetoothAdapterState.unknown);
+    switch (state) {
+      case BluetoothAdapterState.unauthorized:
+        throw StateError(
+            'Bluetooth の使用が許可されていません。設定アプリで許可してください');
+      case BluetoothAdapterState.off:
+        throw StateError('Bluetooth がオフになっています。オンにしてください');
+      case BluetoothAdapterState.unavailable:
+        throw StateError('この端末では Bluetooth が利用できません');
+      case BluetoothAdapterState.on:
+      case BluetoothAdapterState.turningOn:
+      case BluetoothAdapterState.turningOff:
+      case BluetoothAdapterState.unknown:
+        break;
     }
 
     connectionState.value = OmiConnectionState.scanning;

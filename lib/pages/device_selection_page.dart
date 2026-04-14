@@ -33,7 +33,13 @@ class _DeviceSelectionPageState extends State<DeviceSelectionPage> {
       setState(() => _devices = results);
     } catch (e) {
       if (!mounted) return;
-      setState(() => _error = e.toString());
+      // Strip "Bad state: " / "StateError: " prefix that Dart adds to
+      // toString() so the Japanese message reaches the user cleanly.
+      final raw = e.toString();
+      final clean = raw
+          .replaceFirst('Bad state: ', '')
+          .replaceFirst('StateError: ', '');
+      setState(() => _error = clean);
     } finally {
       if (mounted) setState(() => _scanning = false);
     }
