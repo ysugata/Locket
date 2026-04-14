@@ -45,8 +45,8 @@ Flutterアプリ (iOS優先 / Android対応) です。
 既存の `omi_whisper_bridge.py` の実装を勝手に推測で変えない:
 
 - WebSocket 接続先は **ルートパス `/`**
-- 認証は **`?token=<AUTH_TOKEN>` クエリのみ** (Bearerヘッダは bridge が
-  読まないので送らない)
+- 認証は **`?token=<AUTH_TOKEN>` クエリのみ** (bridge は Bearer ヘッダを
+  読まない)
 - **`?codec=opus` と `?frame_header=3byte` は両方必須**。どちらか欠けると
   bridge は 4400 で切断する
 - ハンドシェイク無し。接続したら即 binary フレームを送り始める
@@ -58,6 +58,35 @@ Flutterアプリ (iOS優先 / Android対応) です。
   (WS プロトコルレベルの ping は `IOWebSocketChannel.pingInterval` で OK)
 - SDカード一括アップロード: `POST /sdcard/upload?token=X&codec=opus&frame_header=3byte`
   body は OPUS フレーム連結
+
+### 5. WebSocket 接続は Omi 互換ヘッダーを必ず送る
+
+**重要: 認証が query 経由だけだとしても、接続時の HTTP upgrade には必ず
+Omi 互換の HTTP ヘッダーを付与する。** これを省略すると経路の途中
+(cloudflared もしくはその前段) で binary フレームが silently drop される
+挙動を実測で確認済み (2026-04-14 のデバッグセッション)。
+
+必須ヘッダー:
+
+```dart
+IOWebSocketChannel.connect(
+  uri,
+  headers: {
+    'Authorization': 'Bearer $authToken',
+    'X-App-Platform': 'ios',
+    'X-App-Version': '1.0.0',
+    'X-Device-Id-Hash': deviceId,
+    'X-Request-Start-Time':
+        (DateTime.now().millisecondsSinceEpoch / 1000).toString(),
+  },
+  pingInterval: Duration(seconds: 20),
+  connectTimeout: Duration(seconds: 15),
+);
+```
+
+`dart:io` の `WebSocket.connect` を直接呼ぶ経路は header 指定が弱く、
+同じ現象 (sink.add は成功するが TCP には 1 バイトも乗らない) が再発する。
+必ず `package:web_socket_channel` の `IOWebSocketChannel.connect` を使う。
 
 ## Git ワークフロー
 

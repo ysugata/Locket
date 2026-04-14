@@ -79,12 +79,15 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 12),
           TextField(
             controller: _token,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               labelText: '認証トークン',
-              border: OutlineInputBorder(),
+              border: const OutlineInputBorder(),
+              helperText:
+                  '現在保存されている値: ${_tokenPreview(settings.authToken)}',
             ),
-            obscureText: true,
             autocorrect: false,
+            enableSuggestions: false,
+            maxLines: 1,
           ),
           const SizedBox(height: 24),
           Text('デバイス', style: Theme.of(context).textTheme.titleMedium),
@@ -145,5 +148,14 @@ class _SettingsPageState extends State<SettingsPage> {
         ],
       ),
     );
+  }
+
+  /// Shows first 4 / last 2 chars + length, or "(未設定)". Lets the
+  /// user verify that what they just typed matches what's already
+  /// persisted, without revealing the full token.
+  static String _tokenPreview(String token) {
+    if (token.isEmpty) return '(未設定)';
+    if (token.length <= 6) return '${token.length}文字';
+    return '${token.substring(0, 4)}…${token.substring(token.length - 2)} (${token.length}文字)';
   }
 }

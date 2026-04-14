@@ -4,23 +4,25 @@ import 'package:locket/services/whisper_streamer.dart';
 
 void main() {
   group('buildWhisperUri', () {
-    test('https base → wss with all query params', () {
+    test('https base → wss /v4/listen with Omi query params', () {
       final uri = buildWhisperUri(
         baseUrl: 'https://whisper.localai.loan',
-        authToken: 'abc123',
+        authToken: 'secret',
         deviceId: 'dev-1',
         language: 'ja',
       );
       expect(uri.scheme, 'wss');
       expect(uri.host, 'whisper.localai.loan');
-      expect(uri.path, '/');
-      expect(uri.queryParameters['token'], 'abc123');
-      expect(uri.queryParameters['codec'], 'opus');
-      expect(uri.queryParameters['sample_rate'], '16000');
-      expect(uri.queryParameters['channels'], '1');
+      expect(uri.path, '/v4/listen');
       expect(uri.queryParameters['language'], 'ja');
-      expect(uri.queryParameters['device_id'], 'dev-1');
-      expect(uri.queryParameters['frame_header'], '3byte');
+      expect(uri.queryParameters['sample_rate'], '16000');
+      expect(uri.queryParameters['codec'], 'opus');
+      expect(uri.queryParameters['uid'], 'dev-1');
+      expect(uri.queryParameters['include_speech_profile'], 'false');
+      expect(uri.queryParameters['conversation_timeout'], '120');
+      expect(uri.queryParameters['speaker_auto_assign'], 'enabled');
+      // Auth is via Authorization: Bearer header, not query.
+      expect(uri.queryParameters.containsKey('token'), false);
     });
 
     test('http base → ws', () {
@@ -33,6 +35,7 @@ void main() {
       expect(uri.scheme, 'ws');
       expect(uri.host, 'localhost');
       expect(uri.port, 8080);
+      expect(uri.path, '/v4/listen');
     });
 
     test('wss base stays wss', () {
@@ -45,14 +48,14 @@ void main() {
       expect(uri.scheme, 'wss');
     });
 
-    test('empty path becomes "/"', () {
+    test('trailing slash in base is tolerated', () {
       final uri = buildWhisperUri(
-        baseUrl: 'https://example.com',
+        baseUrl: 'https://example.com/',
         authToken: 't',
         deviceId: 'd',
         language: 'ja',
       );
-      expect(uri.path, '/');
+      expect(uri.path, '/v4/listen');
     });
   });
 
