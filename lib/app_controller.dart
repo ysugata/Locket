@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 
 import 'models/transcript_segment.dart';
 import 'services/background_service.dart';
+import 'services/ios_audio_session.dart';
 import 'services/omi_device_service.dart';
 import 'services/settings_service.dart';
 import 'services/whisper_streamer.dart';
@@ -57,6 +58,9 @@ class AppController extends ChangeNotifier {
     }
 
     try {
+      // Activate AVAudioSession before foreground service starts so
+      // iOS credits the app for both audio and BLE background work.
+      await IOSAudioSession.configureForBluetooth();
       await background.start();
       device.enableAutoReconnect(settings.autoReconnect);
       await device.connect(bleId);
@@ -91,6 +95,7 @@ class AppController extends ChangeNotifier {
     _streamer = null;
     await device.disconnect();
     await background.stop();
+    await IOSAudioSession.deactivate();
     notifyListeners();
   }
 
