@@ -105,7 +105,11 @@ class _StatusCard extends StatelessWidget {
     final streamer = app.streamer;
     final wsState =
         streamer?.connectionState.value ?? WhisperConnectionState.disconnected;
+    // Combine errors from the AppController (start/stop, BLE permission,
+    // missing settings) and the WhisperStreamer (WS handshake, close).
     final wsError = streamer?.lastError.value;
+    final controllerError = app.lastError;
+    final displayError = wsError ?? controllerError;
     final sent = streamer?.bytesSent.value ?? 0;
     final received = streamer?.messagesReceived.value ?? 0;
     final uri = streamer?.lastUri;
@@ -150,10 +154,10 @@ class _StatusCard extends StatelessWidget {
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ],
-            if (wsError != null) ...[
+            if (displayError != null) ...[
               const SizedBox(height: 8),
               Text(
-                'エラー: $wsError',
+                'エラー: $displayError',
                 style: TextStyle(
                   color: Theme.of(context).colorScheme.error,
                   fontSize: 12,
@@ -168,13 +172,23 @@ class _StatusCard extends StatelessWidget {
     );
   }
 
+  /// Builds the displayed URL by hand instead of going through
+  /// `Uri.toString()` after replacing query parameters — that path
+  /// percent-encodes the redaction characters (e.g. `*` → `%2A`)
+  /// and the result becomes unreadable.
   static String _redactToken(Uri uri) {
-    final params = Map<String, String>.from(uri.queryParameters);
-    if (params.containsKey('token')) {
-      final t = params['token']!;
-      params['token'] = t.length <= 6 ? '***' : '${t.substring(0, 3)}***';
-    }
-    return uri.replace(queryParameters: params).toString();
+    final origin =
+        '${uri.scheme}://${uri.host}${uri.hasPort ? ':${uri.port}' : ''}${uri.path}';
+    final parts = <String>[];
+    uri.queryParameters.forEach((k, v) {
+      if (k == 'token') {
+        final masked = v.length <= 6 ? 'xxx' : '${v.substring(0, 3)}…';
+        parts.add('$k=$masked');
+      } else {
+        parts.add('$k=$v');
+      }
+    });
+    return parts.isEmpty ? origin : '$origin?${parts.join('&')}';
   }
 
   static String _formatBytes(int bytes) {

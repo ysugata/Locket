@@ -24,11 +24,14 @@ Future<void> main() async {
 
   runApp(LocketApp(app: app));
 
-  // Fire-and-forget: a configured user shouldn't have to tap "start"
-  // every time they launch the app. Errors are surfaced via
-  // app.lastError and shown in the home page status card.
-  // ignore: unawaited_futures, discarded_futures
-  app.tryAutoStart();
+  // Defer auto-start to after the first frame: BLE / foreground
+  // service / iOS audio session method channels are only fully
+  // wired up once the engine has rendered. Calling start() before
+  // that races against the platform side and silently fails on iOS.
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    // ignore: unawaited_futures, discarded_futures
+    app.tryAutoStart();
+  });
 }
 
 class LocketApp extends StatelessWidget {
