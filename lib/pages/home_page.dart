@@ -102,8 +102,13 @@ class _StatusCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final bleState = app.device.connectionState.value;
-    final wsState = app.streamer?.connectionState.value ??
-        WhisperConnectionState.disconnected;
+    final streamer = app.streamer;
+    final wsState =
+        streamer?.connectionState.value ?? WhisperConnectionState.disconnected;
+    final wsError = streamer?.lastError.value;
+    final sent = streamer?.bytesSent.value ?? 0;
+    final received = streamer?.messagesReceived.value ?? 0;
+    final uri = streamer?.lastUri;
 
     return Card(
       child: Padding(
@@ -127,10 +132,55 @@ class _StatusCard extends StatelessWidget {
                 Text('WebSocket: ${_wsLabel(wsState)}'),
               ],
             ),
+            if (uri != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _redactToken(uri),
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      fontFamily: 'monospace',
+                    ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+            if (streamer != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                '送信 ${_formatBytes(sent)} / 受信 $received メッセージ',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+            if (wsError != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                'エラー: $wsError',
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 12,
+                ),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
           ],
         ),
       ),
     );
+  }
+
+  static String _redactToken(Uri uri) {
+    final params = Map<String, String>.from(uri.queryParameters);
+    if (params.containsKey('token')) {
+      final t = params['token']!;
+      params['token'] = t.length <= 6 ? '***' : '${t.substring(0, 3)}***';
+    }
+    return uri.replace(queryParameters: params).toString();
+  }
+
+  static String _formatBytes(int bytes) {
+    if (bytes < 1024) return '${bytes}B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
+    return '${(bytes / 1024 / 1024).toStringAsFixed(2)}MB';
   }
 
   Color _bleColor(BuildContext context, OmiConnectionState s) {

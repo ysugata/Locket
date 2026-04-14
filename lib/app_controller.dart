@@ -21,6 +21,7 @@ class AppController extends ChangeNotifier {
 
   WhisperStreamer? _streamer;
   StreamSubscription<TranscriptSegment>? _transcriptSub;
+  Timer? _byteRefresh;
 
   final Queue<TranscriptSegment> _transcripts = Queue<TranscriptSegment>();
   List<TranscriptSegment> get transcripts => List.unmodifiable(_transcripts);
@@ -38,6 +39,19 @@ class AppController extends ChangeNotifier {
   });
 
   WhisperStreamer? get streamer => _streamer;
+
+  /// Returns true when the user has provided everything required for
+  /// `start()` to do real work.
+  bool get isConfigured =>
+      settings.authToken.isNotEmpty &&
+      (settings.pairedBleId?.isNotEmpty ?? false);
+
+  /// Starts the relay only when settings are complete. Used at app
+  /// launch so a configured user does not need to tap a button.
+  Future<void> tryAutoStart() async {
+    if (!isConfigured || _running) return;
+    await start();
+  }
 
   /// Starts BLE + WebSocket relay and the foreground service.
   /// Requires a paired BLE device id and a non-empty auth token.
@@ -65,17 +79,32 @@ class AppController extends ChangeNotifier {
       device.enableAutoReconnect(settings.autoReconnect);
       await device.connect(bleId);
 
-      _streamer = WhisperStreamer(
+      final streamer = WhisperStreamer(
         baseUrl: settings.baseUrl,
         authToken: settings.authToken,
         deviceId: settings.deviceId,
         language: settings.language,
       );
-      await _streamer!.connect();
-      _streamer!.streamAudio(device.audioStream);
+      // Forward streamer state changes so the HomePage AnimatedBuilder
+      // (which only watches `this`) rebuilds when WS state or errors
+      // change. bytesSent is updated ~100 Hz from the BLE notify
+      // stream, so it's throttled to a periodic refresh instead of
+      // rebuilding the home page on every audio packet.
+      streamer.connectionState.addListener(notifyListeners);
+      streamer.lastError.addListener(notifyListeners);
+      streamer.messagesReceived.addListener(notifyListeners);
+      _byteRefresh?.cancel();
+      _byteRefresh = Timer.periodic(
+        const Duration(milliseconds: 500),
+        (_) => notifyListeners(),
+      );
+      _streamer = streamer;
+
+      await streamer.connect();
+      streamer.streamAudio(device.audioStream);
 
       _transcriptSub?.cancel();
-      _transcriptSub = _streamer!.transcripts.listen(_onTranscript);
+      _transcriptSub = streamer.transcripts.listen(_onTranscript);
 
       _running = true;
       notifyListeners();
@@ -88,6 +117,8 @@ class AppController extends ChangeNotifier {
 
   Future<void> stop() async {
     _running = false;
+    _byteRefresh?.cancel();
+    _byteRefresh = null;
     await _transcriptSub?.cancel();
     _transcriptSub = null;
     await _streamer?.disconnect();

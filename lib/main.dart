@@ -23,6 +23,12 @@ Future<void> main() async {
   );
 
   runApp(LocketApp(app: app));
+
+  // Fire-and-forget: a configured user shouldn't have to tap "start"
+  // every time they launch the app. Errors are surfaced via
+  // app.lastError and shown in the home page status card.
+  // ignore: unawaited_futures, discarded_futures
+  app.tryAutoStart();
 }
 
 class LocketApp extends StatelessWidget {

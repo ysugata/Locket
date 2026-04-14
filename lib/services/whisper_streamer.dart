@@ -83,12 +83,32 @@ class WhisperStreamer extends ChangeNotifier {
   final ValueNotifier<WhisperConnectionState> connectionState =
       ValueNotifier(WhisperConnectionState.disconnected);
 
+  /// Last connection failure or close reason, surfaced in the UI so
+  /// the user can tell whether the relay is misconfigured (bad token,
+  /// wrong URL, TLS error) versus genuinely offline.
+  final ValueNotifier<String?> lastError = ValueNotifier<String?>(null);
+
+  /// Cumulative number of audio bytes pushed to the socket since the
+  /// streamer was created. Helpful debug signal — if BLE is connected
+  /// and bytesSent stays at 0 the audio stream isn't being piped in.
+  final ValueNotifier<int> bytesSent = ValueNotifier<int>(0);
+
+  /// Number of JSON messages received from the server. If this is 0
+  /// while audio is flowing, the server isn't accepting our payload.
+  final ValueNotifier<int> messagesReceived = ValueNotifier<int>(0);
+
   final _transcriptController =
       StreamController<TranscriptSegment>.broadcast();
   Stream<TranscriptSegment> get transcripts => _transcriptController.stream;
 
   final Queue<Uint8List> _walBuffer = Queue<Uint8List>();
   int _walBufferBytes = 0;
+
+  /// URI used for the most recent connection attempt. Exposed so the
+  /// UI can show the user exactly what scheme/host/path is being hit
+  /// (with the token redacted).
+  Uri? _lastUri;
+  Uri? get lastUri => _lastUri;
 
   WhisperStreamer({
     required this.baseUrl,
@@ -115,30 +135,47 @@ class WhisperStreamer extends ChangeNotifier {
     connectionState.value = WhisperConnectionState.connecting;
     notifyListeners();
 
+    final uri = _buildUri();
+    _lastUri = uri;
+
     try {
-      final channel = WebSocketChannel.connect(_buildUri());
+      final channel = WebSocketChannel.connect(uri);
       await channel.ready;
       _channel = channel;
 
       _channelSub = channel.stream.listen(
         _onMessage,
-        onDone: _onChannelDone,
-        onError: (Object error, StackTrace _) => _onChannelDone(),
+        onDone: () {
+          final code = channel.closeCode;
+          final reason = channel.closeReason;
+          if (code != null || (reason != null && reason.isNotEmpty)) {
+            lastError.value =
+                'WebSocket closed (code=$code${reason == null || reason.isEmpty ? '' : ', $reason'})';
+          }
+          _onChannelDone();
+        },
+        onError: (Object error, StackTrace _) {
+          lastError.value = error.toString();
+          _onChannelDone();
+        },
         cancelOnError: true,
       );
 
       connectionState.value = WhisperConnectionState.connected;
+      lastError.value = null;
       _currentBackoff = _initialBackoff;
       notifyListeners();
 
       _startHeartbeat();
       _flushWalBuffer();
-    } catch (_) {
+    } catch (e) {
+      lastError.value = e.toString();
       _scheduleReconnect();
     }
   }
 
   void _onMessage(dynamic message) {
+    messagesReceived.value = messagesReceived.value + 1;
     if (message is String) {
       try {
         final decoded = jsonDecode(message);
@@ -222,8 +259,10 @@ class WhisperStreamer extends ChangeNotifier {
         connectionState.value == WhisperConnectionState.connected) {
       try {
         channel.sink.add(bytes);
+        bytesSent.value = bytesSent.value + bytes.length;
         return;
-      } catch (_) {
+      } catch (e) {
+        lastError.value = e.toString();
         _onChannelDone();
       }
     }
@@ -301,6 +340,9 @@ class WhisperStreamer extends ChangeNotifier {
     }
     _transcriptController.close();
     connectionState.dispose();
+    lastError.dispose();
+    bytesSent.dispose();
+    messagesReceived.dispose();
     super.dispose();
   }
 }
