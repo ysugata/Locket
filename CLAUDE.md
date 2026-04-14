@@ -17,21 +17,20 @@ Flutterアプリ (iOS優先 / Android対応) です。
 ### 1. アプリはOPUSをデコードしない
 
 - `opus_dart` / `flutter_opus` 等のOPUSデコーダパッケージは **追加禁止**
-- BLE Notify で受け取った OPUS ペイロードは中身を一切いじらず WS に送る
+- BLE Notify で受け取ったバイトは中身を一切いじらず WS に送る
 - 「文字起こしの内容がおかしい」等の問題はサーバー側で調査する。アプリ側で
   デコード処理を足して解決しようとしない
 
-### 2. 3バイトヘッダは送信前に剥がす
+### 2. 3バイトヘッダの処理はサーバー責務
 
 - Omiパケット先頭の `[packet_id_low, packet_id_high, fragment_index]`
-  3バイトヘッダは **デバイス側 WAL 用のメタデータ** であって OPUS の
-  一部ではない。これを付けたまま送ると最初の TOC バイトが化けて
-  サーバーの OPUS デコーダがエラー → クリーンクローズ (code=1000) →
-  再接続ループになる
-- BasedHardware/omi の `app/lib/services/audio_sources/ble_device_source.dart`
-  の `getSocketPayload` も必ず剥がしている。Locket も同じパターン
-- 剥がすのは「ヘッダの除去」だけで OPUS デコードではないので、
-  ルール 1 (デコード禁止) には抵触しない
+  3バイトヘッダは **剥がさずに送信** する
+- ユーザーの `omi_whisper_bridge.py` は接続URLの `frame_header=3byte`
+  クエリでこの形式を期待し、受信後に剥がして OPUS デコードを行う
+- フラグメント再構築もサーバー側で行う。アプリは流すだけ
+- BasedHardware/omi 公式クライアントは `getSocketPayload` で剥がしているが、
+  これは omi 公式バックエンドの仕様。**Locket はユーザーの bridge
+  に合わせる** (剥がさない)
 
 ### 3. iOS優先 / Android共通コード
 
@@ -45,14 +44,20 @@ Flutterアプリ (iOS優先 / Android対応) です。
 
 既存の `omi_whisper_bridge.py` の実装を勝手に推測で変えない:
 
-- WebSocket 接続先は **ルートパス `/`** (`/v1/listen` ではない)
-- 認証は **`?token=<AUTH_TOKEN>` クエリのみ** (Bearerヘッダ非対応)
-- Keep-alive は **WebSocket プロトコルレベルの ping** を使う
-  (`IOWebSocketChannel.pingInterval`)。独自のバイナリハートビートを
-  送ると、サーバーがそれを音声フレームとして OPUS デコードしようと
-  して失敗するので絶対に NG
-- SDアップロードエンドポイント `/sdcard/upload` はサーバー側で別途実装される。
-  完成前にPhase 5に着手しない
+- WebSocket 接続先は **ルートパス `/`**
+- 認証は **`?token=<AUTH_TOKEN>` クエリのみ** (Bearerヘッダは bridge が
+  読まないので送らない)
+- **`?codec=opus` と `?frame_header=3byte` は両方必須**。どちらか欠けると
+  bridge は 4400 で切断する
+- ハンドシェイク無し。接続したら即 binary フレームを送り始める
+  (`{"type":"ready"}` のような交換は **しない**)
+- データ送信: WS binary フレームに **Omi 3バイトヘッダ + 生 OPUS
+  ペイロード** をそのまま流す
+- サーバー → クライアント: セグメント確定時に `{"segments":[...]}` JSON
+  テキストのみ。ping/keepalive の特別な仕掛けは無い
+  (WS プロトコルレベルの ping は `IOWebSocketChannel.pingInterval` で OK)
+- SDカード一括アップロード: `POST /sdcard/upload?token=X&codec=opus&frame_header=3byte`
+  body は OPUS フレーム連結
 
 ## Git ワークフロー
 

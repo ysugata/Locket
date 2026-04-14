@@ -20,7 +20,7 @@ void main() {
       expect(uri.queryParameters['channels'], '1');
       expect(uri.queryParameters['language'], 'ja');
       expect(uri.queryParameters['device_id'], 'dev-1');
-      expect(uri.queryParameters.containsKey('frame_header'), false);
+      expect(uri.queryParameters['frame_header'], '3byte');
     });
 
     test('http base → ws', () {

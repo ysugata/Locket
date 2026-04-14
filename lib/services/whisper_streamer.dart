@@ -12,9 +12,11 @@ import '../models/transcript_segment.dart';
 /// Builds the Whisper WebSocket URI from a user-facing base URL plus
 /// the query parameters the bridge expects.
 ///
-/// Matches the Omi reference client (`v4/listen` style): `?token=<X>`
-/// for auth on the user's self-hosted bridge, plus `codec=opus` and
-/// the audio shape so the server doesn't have to guess.
+/// The user's `omi_whisper_bridge.py` rejects (4400) if either
+/// `codec=opus` or `frame_header=3byte` is missing. `frame_header=3byte`
+/// tells the server that each binary message still carries the Omi
+/// `[packet_id_low, packet_id_high, fragment_index]` prefix, which
+/// the server then strips before decoding.
 Uri buildWhisperUri({
   required String baseUrl,
   required String authToken,
@@ -33,6 +35,7 @@ Uri buildWhisperUri({
     queryParameters: {
       'token': authToken,
       'codec': 'opus',
+      'frame_header': '3byte',
       'sample_rate': '16000',
       'channels': '1',
       'language': language,
@@ -42,11 +45,10 @@ Uri buildWhisperUri({
 }
 
 /// Number of bytes Omi firmware prepends to every BLE notification:
-/// `[packet_id_low, packet_id_high, fragment_index]`. The header is
-/// only used by the device-side WAL for fragment ordering — it is
-/// **not** part of the OPUS payload and must be removed before the
-/// bytes hit any decoder. Matches `getSocketPayload` in the Omi
-/// reference client (`app/lib/services/audio_sources/ble_device_source.dart`).
+/// `[packet_id_low, packet_id_high, fragment_index]`. The user's
+/// `omi_whisper_bridge.py` strips this server-side when the URL
+/// includes `frame_header=3byte`, so the client must send the BLE
+/// bytes verbatim — header included.
 const int omiBleHeaderSize = 3;
 
 enum WhisperConnectionState {
@@ -59,12 +61,11 @@ enum WhisperConnectionState {
 /// Relays Omi BLE audio (OPUS, 16 kHz mono) to the self-hosted Whisper
 /// server over a WebSocket.
 ///
-/// The 3-byte Omi packet header is stripped before each binary message
-/// is sent, matching the Omi reference Flutter app. Without this the
-/// server tries to OPUS-decode a malformed first byte and closes the
-/// connection cleanly, producing a reconnect loop with zero
-/// transcripts. The app does **not** decode OPUS — only the header
-/// strip happens here.
+/// Each BLE notification is forwarded verbatim — Omi 3-byte header
+/// included. The bridge expects this format because the URL is
+/// opened with `frame_header=3byte`, and the bridge does the header
+/// stripping and OPUS decoding server-side. The app never touches
+/// the audio bytes.
 class WhisperStreamer extends ChangeNotifier {
   static const Duration _pingInterval = Duration(seconds: 20);
   static const Duration _connectTimeout = Duration(seconds: 15);
@@ -108,6 +109,24 @@ class WhisperStreamer extends ChangeNotifier {
   /// while audio is flowing, the server isn't accepting our payload.
   final ValueNotifier<int> messagesReceived = ValueNotifier<int>(0);
 
+  /// Rolling debug log of lifecycle events and server-sent messages,
+  /// most recent first. Capped at 50 entries. The user can paste
+  /// this when reporting connection issues — it makes it possible to
+  /// see exactly which protocol the server speaks (raw audio vs
+  /// Wyoming vs ping/pong vs ready handshake) without server access.
+  final ValueNotifier<List<String>> debugLog =
+      ValueNotifier<List<String>>(const []);
+  static const int _debugLogMax = 50;
+
+  void _log(String entry) {
+    final ts = DateTime.now().toIso8601String().substring(11, 23);
+    final next = ['$ts $entry', ...debugLog.value];
+    if (next.length > _debugLogMax) {
+      next.removeRange(_debugLogMax, next.length);
+    }
+    debugLog.value = next;
+  }
+
   final _transcriptController =
       StreamController<TranscriptSegment>.broadcast();
   Stream<TranscriptSegment> get transcripts => _transcriptController.stream;
@@ -150,26 +169,26 @@ class WhisperStreamer extends ChangeNotifier {
     _lastUri = uri;
 
     try {
-      // Send the auth token both as a query parameter (the bridge
-      // accepts ?token=) and as an Authorization: Bearer header (the
-      // upstream Omi backend uses this). Sending both is harmless if
-      // one is ignored. pingInterval also installs a WebSocket
-      // protocol-level keep-alive on top of the application "ping"
-      // text the server sends.
+      _log('connecting → ${uri.host}${uri.path}');
+      // Auth is via ?token= query parameter only — the user's bridge
+      // explicitly does not support Bearer headers, and sending one
+      // can confuse stricter middleware.
       final channel = IOWebSocketChannel.connect(
         uri,
-        headers: {'Authorization': 'Bearer $authToken'},
         pingInterval: _pingInterval,
         connectTimeout: _connectTimeout,
       );
       await channel.ready;
       _channel = channel;
+      _log('connected');
 
       _channelSub = channel.stream.listen(
         _onMessage,
         onDone: () {
           final code = channel.closeCode;
           final reason = channel.closeReason;
+          _log(
+              'closed code=$code reason=${(reason == null || reason.isEmpty) ? '(none)' : reason}');
           if (code != null || (reason != null && reason.isNotEmpty)) {
             lastError.value =
                 'WebSocket closed (code=$code${reason == null || reason.isEmpty ? '' : ', $reason'})';
@@ -177,6 +196,7 @@ class WhisperStreamer extends ChangeNotifier {
           _onChannelDone();
         },
         onError: (Object error, StackTrace _) {
+          _log('error $error');
           lastError.value = error.toString();
           _onChannelDone();
         },
@@ -190,6 +210,7 @@ class WhisperStreamer extends ChangeNotifier {
 
       _flushWalBuffer();
     } catch (e) {
+      _log('connect failed: $e');
       lastError.value = e.toString();
       _scheduleReconnect();
     }
@@ -198,21 +219,18 @@ class WhisperStreamer extends ChangeNotifier {
   void _onMessage(dynamic message) {
     messagesReceived.value = messagesReceived.value + 1;
 
-    // Server-initiated keep-alive: the Omi backend (and the user's
-    // bridge that mirrors it) sends the literal text "ping" every
-    // ~10 seconds. The protocol expects a 2-byte binary pong frame
-    // back ([0x8A, 0x00]); the server treats anything <=2 bytes as
-    // a pong and leaves the connection alive. Without this reply
-    // the server tears the session down cleanly (code=1000) within
-    // the first heartbeat cycle. Mirrors pure_socket.dart in
-    // BasedHardware/omi.
-    if (message == 'ping') {
-      try {
-        _channel?.sink.add(Uint8List.fromList(const [0x8A, 0x00]));
-      } catch (_) {
-        // Sink may already be closing; ignore.
-      }
-      return;
+    // Log a short preview of every server-sent message so the user
+    // can see the protocol the server actually speaks.
+    if (message is String) {
+      final preview = message.length > 120
+          ? '${message.substring(0, 120)}…'
+          : message;
+      _log('recv text: $preview');
+    } else if (message is List<int>) {
+      _log(
+          'recv bin: ${message.length}B ${message.take(8).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}…');
+    } else {
+      _log('recv ${message.runtimeType}');
     }
 
     if (message is String) {
@@ -271,16 +289,17 @@ class WhisperStreamer extends ChangeNotifier {
     _reconnectTimer = Timer(delay, _openChannel);
   }
 
-  /// Forwards Omi BLE bytes to the WebSocket after stripping the
-  /// 3-byte packet header. Packets that arrive while the socket is
-  /// down are queued in a bounded in-memory WAL and flushed on
-  /// reconnect.
+  /// Forwards Omi BLE bytes to the WebSocket verbatim — header
+  /// included. The bridge identifies the format via the URL's
+  /// `frame_header=3byte` query parameter and strips the prefix
+  /// server-side before OPUS decoding. Packets that arrive while
+  /// the socket is down are queued in a bounded in-memory WAL and
+  /// flushed on reconnect.
   void streamAudio(Stream<Uint8List> audioStream) {
     _audioSub?.cancel();
     _audioSub = audioStream.listen((bytes) {
       if (bytes.length <= omiBleHeaderSize) return;
-      final payload = Uint8List.sublistView(bytes, omiBleHeaderSize);
-      _sendOrBuffer(payload);
+      _sendOrBuffer(bytes);
     });
   }
 
@@ -289,10 +308,15 @@ class WhisperStreamer extends ChangeNotifier {
     if (channel != null &&
         connectionState.value == WhisperConnectionState.connected) {
       try {
+        if (bytesSent.value == 0) {
+          _log(
+              'first audio packet ${bytes.length}B ${bytes.take(8).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}…');
+        }
         channel.sink.add(bytes);
         bytesSent.value = bytesSent.value + bytes.length;
         return;
       } catch (e) {
+        _log('sink.add error $e');
         lastError.value = e.toString();
         _onChannelDone();
       }
@@ -371,6 +395,7 @@ class WhisperStreamer extends ChangeNotifier {
     lastError.dispose();
     bytesSent.dispose();
     messagesReceived.dispose();
+    debugLog.dispose();
     super.dispose();
   }
 }

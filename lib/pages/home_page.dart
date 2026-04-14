@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../app_controller.dart';
 import '../services/omi_device_service.dart';
@@ -12,6 +13,14 @@ class HomePage extends StatelessWidget {
   void _openSettings(BuildContext context) {
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => SettingsPage(app: app)),
+    );
+  }
+
+  void _showDebugLog(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => _DebugLogSheet(app: app),
     );
   }
 
@@ -37,6 +46,11 @@ class HomePage extends StatelessWidget {
           appBar: AppBar(
             title: const Text('Locket'),
             actions: [
+              IconButton(
+                icon: const Icon(Icons.bug_report),
+                tooltip: 'デバッグログ',
+                onPressed: () => _showDebugLog(context),
+              ),
               IconButton(
                 icon: const Icon(Icons.settings),
                 onPressed: () => _openSettings(context),
@@ -400,6 +414,89 @@ class _SetupStep extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Text(text, style: TextStyle(color: color)),
+    );
+  }
+}
+
+class _DebugLogSheet extends StatelessWidget {
+  final AppController app;
+  const _DebugLogSheet({required this.app});
+
+  @override
+  Widget build(BuildContext context) {
+    return DraggableScrollableSheet(
+      initialChildSize: 0.7,
+      minChildSize: 0.3,
+      maxChildSize: 0.95,
+      expand: false,
+      builder: (context, scrollController) {
+        return AnimatedBuilder(
+          animation: app,
+          builder: (context, _) {
+            final streamer = app.streamer;
+            final entries = streamer?.debugLog.value ?? const <String>[];
+            return Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.bug_report),
+                      const SizedBox(width: 8),
+                      Text(
+                        'WS デバッグログ (${entries.length})',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const Spacer(),
+                      IconButton(
+                        icon: const Icon(Icons.copy),
+                        tooltip: 'コピー',
+                        onPressed: entries.isEmpty
+                            ? null
+                            : () async {
+                                final text = entries.reversed.join('\n');
+                                await Clipboard.setData(
+                                    ClipboardData(text: text));
+                                if (context.mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                        content: Text('クリップボードにコピー')),
+                                  );
+                                }
+                              },
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () => Navigator.of(context).pop(),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1),
+                Expanded(
+                  child: entries.isEmpty
+                      ? const Center(child: Text('まだログがありません'))
+                      : ListView.builder(
+                          controller: scrollController,
+                          itemCount: entries.length,
+                          itemBuilder: (_, i) => Padding(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 2),
+                            child: Text(
+                              entries[i],
+                              style: const TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 11,
+                              ),
+                            ),
+                          ),
+                        ),
+                ),
+              ],
+            );
+          },
+        );
+      },
     );
   }
 }

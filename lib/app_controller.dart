@@ -132,6 +132,7 @@ class AppController extends ChangeNotifier {
       streamer.connectionState.addListener(notifyListeners);
       streamer.lastError.addListener(notifyListeners);
       streamer.messagesReceived.addListener(notifyListeners);
+      streamer.debugLog.addListener(notifyListeners);
       _byteRefresh?.cancel();
       _byteRefresh = Timer.periodic(
         const Duration(milliseconds: 500),
