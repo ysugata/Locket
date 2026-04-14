@@ -20,7 +20,7 @@ void main() {
       expect(uri.queryParameters['channels'], '1');
       expect(uri.queryParameters['language'], 'ja');
       expect(uri.queryParameters['device_id'], 'dev-1');
-      expect(uri.queryParameters['frame_header'], '3byte');
+      expect(uri.queryParameters.containsKey('frame_header'), false);
     });
 
     test('http base → ws', () {
@@ -53,6 +53,12 @@ void main() {
         language: 'ja',
       );
       expect(uri.path, '/');
+    });
+  });
+
+  group('omiBleHeaderSize', () {
+    test('matches Omi firmware: 2 bytes packet id + 1 byte fragment idx', () {
+      expect(omiBleHeaderSize, 3);
     });
   });
 

@@ -16,17 +16,22 @@ Flutterアプリ (iOS優先 / Android対応) です。
 
 ### 1. アプリはOPUSをデコードしない
 
-- BLE Notify で受け取った生バイト（3バイトヘッダ + OPUSペイロード）を
-  **そのままサーバーへ送る**
 - `opus_dart` / `flutter_opus` 等のOPUSデコーダパッケージは **追加禁止**
-- 「文字起こしが空」「精度が悪い」等の問題はサーバー側で調査する。
-  アプリ側でデコード処理を足して解決しようとしない
+- BLE Notify で受け取った OPUS ペイロードは中身を一切いじらず WS に送る
+- 「文字起こしの内容がおかしい」等の問題はサーバー側で調査する。アプリ側で
+  デコード処理を足して解決しようとしない
 
-### 2. 3バイトヘッダの処理はサーバー責務
+### 2. 3バイトヘッダは送信前に剥がす
 
-- Omiパケット先頭の `[packet_no:2][fragment_idx:1]` ヘッダは
-  **剥がさずに送信**する
-- フラグメント再構築もサーバー側で行う。アプリは流すだけ
+- Omiパケット先頭の `[packet_id_low, packet_id_high, fragment_index]`
+  3バイトヘッダは **デバイス側 WAL 用のメタデータ** であって OPUS の
+  一部ではない。これを付けたまま送ると最初の TOC バイトが化けて
+  サーバーの OPUS デコーダがエラー → クリーンクローズ (code=1000) →
+  再接続ループになる
+- BasedHardware/omi の `app/lib/services/audio_sources/ble_device_source.dart`
+  の `getSocketPayload` も必ず剥がしている。Locket も同じパターン
+- 剥がすのは「ヘッダの除去」だけで OPUS デコードではないので、
+  ルール 1 (デコード禁止) には抵触しない
 
 ### 3. iOS優先 / Android共通コード
 
@@ -42,7 +47,10 @@ Flutterアプリ (iOS優先 / Android対応) です。
 
 - WebSocket 接続先は **ルートパス `/`** (`/v1/listen` ではない)
 - 認証は **`?token=<AUTH_TOKEN>` クエリのみ** (Bearerヘッダ非対応)
-- Keep-alive は 2バイト以下のバイナリ送信 (サーバー側で無視される)
+- Keep-alive は **WebSocket プロトコルレベルの ping** を使う
+  (`IOWebSocketChannel.pingInterval`)。独自のバイナリハートビートを
+  送ると、サーバーがそれを音声フレームとして OPUS デコードしようと
+  して失敗するので絶対に NG
 - SDアップロードエンドポイント `/sdcard/upload` はサーバー側で別途実装される。
   完成前にPhase 5に着手しない
 

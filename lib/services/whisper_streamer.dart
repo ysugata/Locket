@@ -3,17 +3,18 @@ import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/status.dart' as ws_status;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../models/transcript_segment.dart';
 
 /// Builds the Whisper WebSocket URI from a user-facing base URL plus
-/// the fixed query parameters the bridge expects.
+/// the query parameters the bridge expects.
 ///
-/// The server authenticates on `?token=` only — Bearer headers are
-/// not supported. `frame_header=3byte` tells it that each binary
-/// message still carries Omi's `[packet_no:2][fragment_idx:1]` prefix.
+/// Matches the Omi reference client (`v4/listen` style): `?token=<X>`
+/// for auth on the user's self-hosted bridge, plus `codec=opus` and
+/// the audio shape so the server doesn't have to guess.
 Uri buildWhisperUri({
   required String baseUrl,
   required String authToken,
@@ -36,10 +37,17 @@ Uri buildWhisperUri({
       'channels': '1',
       'language': language,
       'device_id': deviceId,
-      'frame_header': '3byte',
     },
   );
 }
+
+/// Number of bytes Omi firmware prepends to every BLE notification:
+/// `[packet_id_low, packet_id_high, fragment_index]`. The header is
+/// only used by the device-side WAL for fragment ordering — it is
+/// **not** part of the OPUS payload and must be removed before the
+/// bytes hit any decoder. Matches `getSocketPayload` in the Omi
+/// reference client (`app/lib/services/audio_sources/ble_device_source.dart`).
+const int omiBleHeaderSize = 3;
 
 enum WhisperConnectionState {
   disconnected,
@@ -48,14 +56,18 @@ enum WhisperConnectionState {
   reconnecting,
 }
 
-/// Relays raw Omi OPUS bytes (3-byte packet header intact) to the
-/// self-hosted Whisper server over a WebSocket.
+/// Relays Omi BLE audio (OPUS, 16 kHz mono) to the self-hosted Whisper
+/// server over a WebSocket.
 ///
-/// The app never decodes audio: bytes received from BLE are forwarded
-/// verbatim. Frame header stripping, fragment reassembly, and OPUS
-/// decoding all happen server-side.
+/// The 3-byte Omi packet header is stripped before each binary message
+/// is sent, matching the Omi reference Flutter app. Without this the
+/// server tries to OPUS-decode a malformed first byte and closes the
+/// connection cleanly, producing a reconnect loop with zero
+/// transcripts. The app does **not** decode OPUS — only the header
+/// strip happens here.
 class WhisperStreamer extends ChangeNotifier {
-  static const Duration _heartbeatInterval = Duration(seconds: 30);
+  static const Duration _pingInterval = Duration(seconds: 20);
+  static const Duration _connectTimeout = Duration(seconds: 15);
   static const Duration _initialBackoff = Duration(seconds: 5);
   static const Duration _maxBackoff = Duration(seconds: 60);
 
@@ -73,7 +85,6 @@ class WhisperStreamer extends ChangeNotifier {
   StreamSubscription<dynamic>? _channelSub;
   StreamSubscription<Uint8List>? _audioSub;
 
-  Timer? _heartbeat;
   Timer? _reconnectTimer;
   Duration _currentBackoff = _initialBackoff;
 
@@ -139,7 +150,16 @@ class WhisperStreamer extends ChangeNotifier {
     _lastUri = uri;
 
     try {
-      final channel = WebSocketChannel.connect(uri);
+      // IOWebSocketChannel exposes pingInterval which sends WebSocket
+      // protocol-level ping frames. Those are control frames, not
+      // delivered to the server's message handler — much safer than
+      // a custom binary heartbeat that the server would otherwise try
+      // to OPUS-decode.
+      final channel = IOWebSocketChannel.connect(
+        uri,
+        pingInterval: _pingInterval,
+        connectTimeout: _connectTimeout,
+      );
       await channel.ready;
       _channel = channel;
 
@@ -166,7 +186,6 @@ class WhisperStreamer extends ChangeNotifier {
       _currentBackoff = _initialBackoff;
       notifyListeners();
 
-      _startHeartbeat();
       _flushWalBuffer();
     } catch (e) {
       lastError.value = e.toString();
@@ -179,7 +198,15 @@ class WhisperStreamer extends ChangeNotifier {
     if (message is String) {
       try {
         final decoded = jsonDecode(message);
-        if (decoded is Map<String, dynamic>) {
+        // Server may send either a bare list of segments (Omi v4 style)
+        // or a {"segments": [...]} envelope.
+        if (decoded is List) {
+          for (final seg in decoded) {
+            if (seg is Map<String, dynamic>) {
+              _transcriptController.add(TranscriptSegment.fromJson(seg));
+            }
+          }
+        } else if (decoded is Map<String, dynamic>) {
           final segments = decoded['segments'];
           if (segments is List) {
             for (final seg in segments) {
@@ -196,7 +223,6 @@ class WhisperStreamer extends ChangeNotifier {
   }
 
   void _onChannelDone() {
-    _stopHeartbeat();
     _channelSub?.cancel();
     _channelSub = null;
     _channel = null;
@@ -225,32 +251,17 @@ class WhisperStreamer extends ChangeNotifier {
     _reconnectTimer = Timer(delay, _openChannel);
   }
 
-  void _startHeartbeat() {
-    _heartbeat?.cancel();
-    _heartbeat = Timer.periodic(_heartbeatInterval, (_) {
-      final channel = _channel;
-      if (channel == null) return;
-      try {
-        // Server ignores binary messages of length <= 2 bytes.
-        channel.sink.add(Uint8List.fromList([0xFF, 0xFF]));
-      } catch (_) {
-        _onChannelDone();
-      }
-    });
-  }
-
-  void _stopHeartbeat() {
-    _heartbeat?.cancel();
-    _heartbeat = null;
-  }
-
-  /// Forwards raw BLE bytes to the WebSocket. Bytes keep Omi's 3-byte
-  /// header — decoding is the server's job. Packets that arrive while
-  /// the socket is down are queued in a bounded in-memory WAL and
-  /// flushed on reconnect.
+  /// Forwards Omi BLE bytes to the WebSocket after stripping the
+  /// 3-byte packet header. Packets that arrive while the socket is
+  /// down are queued in a bounded in-memory WAL and flushed on
+  /// reconnect.
   void streamAudio(Stream<Uint8List> audioStream) {
     _audioSub?.cancel();
-    _audioSub = audioStream.listen(_sendOrBuffer);
+    _audioSub = audioStream.listen((bytes) {
+      if (bytes.length <= omiBleHeaderSize) return;
+      final payload = Uint8List.sublistView(bytes, omiBleHeaderSize);
+      _sendOrBuffer(payload);
+    });
   }
 
   void _sendOrBuffer(Uint8List bytes) {
@@ -290,7 +301,6 @@ class WhisperStreamer extends ChangeNotifier {
       try {
         channel.sink.add(bytes);
       } catch (_) {
-        // Put it back and stop draining; reconnection will retry.
         _walBuffer.addFirst(bytes);
         _walBufferBytes += bytes.length;
         _onChannelDone();
@@ -305,7 +315,6 @@ class WhisperStreamer extends ChangeNotifier {
     _shouldBeConnected = false;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
-    _stopHeartbeat();
     await _audioSub?.cancel();
     _audioSub = null;
     await _channelSub?.cancel();
@@ -328,7 +337,6 @@ class WhisperStreamer extends ChangeNotifier {
     _disposed = true;
     _shouldBeConnected = false;
     _reconnectTimer?.cancel();
-    _stopHeartbeat();
     _audioSub?.cancel();
     _channelSub?.cancel();
     final channel = _channel;
