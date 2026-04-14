@@ -36,7 +36,13 @@ class AppController extends ChangeNotifier {
     required this.settings,
     required this.device,
     required this.background,
-  });
+  }) {
+    // Reflect settings changes (token, paired device, language) into
+    // the live relay automatically — the user no longer has a manual
+    // start/stop control, so a settings save is the only signal that
+    // we should reconnect.
+    settings.addListener(_onSettingsChanged);
+  }
 
   WhisperStreamer? get streamer => _streamer;
 
@@ -52,6 +58,39 @@ class AppController extends ChangeNotifier {
     if (!isConfigured || _running) return;
     await start();
   }
+
+  String? _lastSettingsFingerprint;
+  bool _settingsRestartInFlight = false;
+
+  /// Triggered whenever any settings field changes. If the relay is
+  /// already running with stale settings, we tear it down and bring
+  /// it back up with the new values. If it isn't running yet but is
+  /// now configured, we kick it off.
+  void _onSettingsChanged() {
+    final fp = _settingsFingerprint();
+    if (fp == _lastSettingsFingerprint) return;
+    _lastSettingsFingerprint = fp;
+    if (_settingsRestartInFlight) return;
+    _settingsRestartInFlight = true;
+    Future(() async {
+      try {
+        if (_running) {
+          await stop();
+        }
+        await tryAutoStart();
+      } finally {
+        _settingsRestartInFlight = false;
+      }
+    });
+  }
+
+  String _settingsFingerprint() => [
+        settings.baseUrl,
+        settings.authToken,
+        settings.language,
+        settings.pairedBleId ?? '',
+        settings.autoReconnect.toString(),
+      ].join('|');
 
   /// Starts BLE + WebSocket relay and the foreground service.
   /// Requires a paired BLE device id and a non-empty auth token.
@@ -140,6 +179,7 @@ class AppController extends ChangeNotifier {
 
   @override
   void dispose() {
+    settings.removeListener(_onSettingsChanged);
     stop();
     super.dispose();
   }

@@ -9,20 +9,6 @@ class HomePage extends StatelessWidget {
   final AppController app;
   const HomePage({super.key, required this.app});
 
-  Future<void> _toggle(BuildContext context) async {
-    if (app.running) {
-      await app.stop();
-    } else {
-      await app.start();
-      final err = app.lastError;
-      if (err != null && context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(err)),
-        );
-      }
-    }
-  }
-
   void _openSettings(BuildContext context) {
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => SettingsPage(app: app)),
@@ -82,13 +68,6 @@ class HomePage extends StatelessWidget {
               ),
             ),
           ),
-          floatingActionButton: needsSetup
-              ? null
-              : FloatingActionButton.extended(
-                  onPressed: () => _toggle(context),
-                  icon: Icon(app.running ? Icons.stop : Icons.play_arrow),
-                  label: Text(app.running ? '停止' : '開始'),
-                ),
         );
       },
     );

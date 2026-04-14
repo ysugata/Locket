@@ -150,13 +150,15 @@ class WhisperStreamer extends ChangeNotifier {
     _lastUri = uri;
 
     try {
-      // IOWebSocketChannel exposes pingInterval which sends WebSocket
-      // protocol-level ping frames. Those are control frames, not
-      // delivered to the server's message handler — much safer than
-      // a custom binary heartbeat that the server would otherwise try
-      // to OPUS-decode.
+      // Send the auth token both as a query parameter (the bridge
+      // accepts ?token=) and as an Authorization: Bearer header (the
+      // upstream Omi backend uses this). Sending both is harmless if
+      // one is ignored. pingInterval also installs a WebSocket
+      // protocol-level keep-alive on top of the application "ping"
+      // text the server sends.
       final channel = IOWebSocketChannel.connect(
         uri,
+        headers: {'Authorization': 'Bearer $authToken'},
         pingInterval: _pingInterval,
         connectTimeout: _connectTimeout,
       );
@@ -195,6 +197,24 @@ class WhisperStreamer extends ChangeNotifier {
 
   void _onMessage(dynamic message) {
     messagesReceived.value = messagesReceived.value + 1;
+
+    // Server-initiated keep-alive: the Omi backend (and the user's
+    // bridge that mirrors it) sends the literal text "ping" every
+    // ~10 seconds. The protocol expects a 2-byte binary pong frame
+    // back ([0x8A, 0x00]); the server treats anything <=2 bytes as
+    // a pong and leaves the connection alive. Without this reply
+    // the server tears the session down cleanly (code=1000) within
+    // the first heartbeat cycle. Mirrors pure_socket.dart in
+    // BasedHardware/omi.
+    if (message == 'ping') {
+      try {
+        _channel?.sink.add(Uint8List.fromList(const [0x8A, 0x00]));
+      } catch (_) {
+        // Sink may already be closing; ignore.
+      }
+      return;
+    }
+
     if (message is String) {
       try {
         final decoded = jsonDecode(message);
