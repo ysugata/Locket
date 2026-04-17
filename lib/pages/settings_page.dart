@@ -134,6 +134,8 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 24),
+          _SDCardSection(app: widget.app),
+          const SizedBox(height: 24),
           Text('その他', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
           ListTile(
@@ -157,5 +159,82 @@ class _SettingsPageState extends State<SettingsPage> {
     if (token.isEmpty) return '(未設定)';
     if (token.length <= 6) return '${token.length}文字';
     return '${token.substring(0, 4)}…${token.substring(token.length - 2)} (${token.length}文字)';
+  }
+}
+
+class _SDCardSection extends StatelessWidget {
+  final AppController app;
+  const _SDCardSection({required this.app});
+
+  static String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / 1024 / 1024).toStringAsFixed(2)} MB';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sync = app.sdCardSync;
+    final syncing = sync?.isSyncing.value ?? false;
+    final progress = sync?.progress.value ?? 0.0;
+    final error = sync?.lastError.value;
+    final totalBytes = sync?.totalBytesOnCard ?? 0;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('SDカード同期', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('カード上のデータ: ${_formatBytes(totalBytes)}'),
+                if (syncing) ...[
+                  const SizedBox(height: 12),
+                  LinearProgressIndicator(value: progress),
+                  const SizedBox(height: 4),
+                  Text('${(progress * 100).toStringAsFixed(1)}%',
+                      style: Theme.of(context).textTheme.bodySmall),
+                ],
+                if (error != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    error,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                      fontSize: 12,
+                    ),
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    FilledButton.tonalIcon(
+                      onPressed: sync == null || syncing
+                          ? null
+                          : () => app.syncSDCard(),
+                      icon: const Icon(Icons.sync),
+                      label: const Text('今すぐ同期'),
+                    ),
+                    if (syncing) ...[
+                      const SizedBox(width: 8),
+                      TextButton(
+                        onPressed: () => sync?.cancel(),
+                        child: const Text('キャンセル'),
+                      ),
+                    ],
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
   }
 }

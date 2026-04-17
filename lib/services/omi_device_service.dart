@@ -12,6 +12,11 @@ final _audioServiceGuid = Guid('19b10000-e8f2-537e-4f6c-d104768a1214');
 final _audioDataCharGuid = Guid('19b10001-e8f2-537e-4f6c-d104768a1214');
 final _codecTypeCharGuid = Guid('19b10002-e8f2-537e-4f6c-d104768a1214');
 
+// Omi Storage Service UUIDs
+final _storageServiceGuid = Guid('30295780-4301-eabd-2904-2849adfeae43');
+final _storageDataCharGuid = Guid('30295781-4301-eabd-2904-2849adfeae43');
+final _storageReadCtrlCharGuid = Guid('30295782-4301-eabd-2904-2849adfeae43');
+
 // Standard BLE UUIDs (full 128-bit form, Bluetooth base UUID)
 final _batteryServiceGuid = Guid('0000180f-0000-1000-8000-00805f9b34fb');
 final _batteryLevelCharGuid = Guid('00002a19-0000-1000-8000-00805f9b34fb');
@@ -42,10 +47,14 @@ class OmiDeviceService extends ChangeNotifier {
   static const _maxReconnectAttempts = 10;
 
   final _audioStreamController = StreamController<Uint8List>.broadcast();
+  final _storageStreamController = StreamController<List<int>>.broadcast();
 
   /// Raw BLE notifications from the Omi audio data characteristic.
   /// Bytes include the 3-byte Omi packet header — do not strip.
   Stream<Uint8List> get audioStream => _audioStreamController.stream;
+
+  /// Notifications from the Omi storage data characteristic (30295781).
+  Stream<List<int>> get storageStream => _storageStreamController.stream;
 
   final ValueNotifier<OmiConnectionState> connectionState =
       ValueNotifier(OmiConnectionState.disconnected);
@@ -55,8 +64,12 @@ class OmiDeviceService extends ChangeNotifier {
 
   BluetoothDevice? _device;
   StreamSubscription<List<int>>? _audioSub;
+  StreamSubscription<List<int>>? _storageSub;
   StreamSubscription<List<int>>? _batterySub;
   StreamSubscription<BluetoothConnectionState>? _connSub;
+
+  BluetoothCharacteristic? _storageDataChar;
+  BluetoothCharacteristic? _storageReadCtrlChar;
 
   bool _autoReconnect = true;
   int _reconnectAttempts = 0;
@@ -240,8 +253,59 @@ class OmiDeviceService extends ChangeNotifier {
             }
           }
         }
+      } else if (service.uuid == _storageServiceGuid) {
+        for (final ch in service.characteristics) {
+          if (ch.uuid == _storageDataCharGuid) {
+            _storageDataChar = ch;
+            await ch.setNotifyValue(true);
+            await _storageSub?.cancel();
+            _storageSub = ch.lastValueStream.listen((value) {
+              if (value.isNotEmpty) {
+                _storageStreamController.add(value);
+              }
+            });
+          } else if (ch.uuid == _storageReadCtrlCharGuid) {
+            _storageReadCtrlChar = ch;
+          }
+        }
       }
     }
+  }
+
+  /// Read storage file list. Returns LE uint32 values from the read
+  /// control characteristic (30295782), typically [totalBytes, offset].
+  Future<List<int>> getStorageList() async {
+    final ch = _storageReadCtrlChar;
+    if (ch == null) return [];
+    final raw = await ch.read();
+    if (raw.length < 4) return [];
+    final result = <int>[];
+    for (var i = 0; i + 3 < raw.length; i += 4) {
+      result.add(raw[i] |
+          (raw[i + 1] << 8) |
+          (raw[i + 2] << 16) |
+          (raw[i + 3] << 24));
+    }
+    return result;
+  }
+
+  /// Write a storage command to the data characteristic (30295781).
+  /// [command]: 0x00 = start read, 0x01 = clear, 0x03 = stop.
+  /// [fileNum]: file number (typically 1).
+  /// [offset]: 4-byte big-endian read offset.
+  Future<void> writeStorageCommand(int command, int fileNum, int offset) async {
+    final ch = _storageDataChar;
+    if (ch == null) {
+      throw StateError('Storage data characteristic not available');
+    }
+    final bytes = Uint8List(6);
+    bytes[0] = command & 0xFF;
+    bytes[1] = fileNum & 0xFF;
+    bytes[2] = (offset >> 24) & 0xFF;
+    bytes[3] = (offset >> 16) & 0xFF;
+    bytes[4] = (offset >> 8) & 0xFF;
+    bytes[5] = offset & 0xFF;
+    await ch.write(bytes, withoutResponse: false);
   }
 
   void _handleDisconnection() {
@@ -280,6 +344,10 @@ class OmiDeviceService extends ChangeNotifier {
     _reconnectTimer = null;
     await _audioSub?.cancel();
     _audioSub = null;
+    await _storageSub?.cancel();
+    _storageSub = null;
+    _storageDataChar = null;
+    _storageReadCtrlChar = null;
     await _batterySub?.cancel();
     _batterySub = null;
     await _connSub?.cancel();
@@ -310,9 +378,11 @@ class OmiDeviceService extends ChangeNotifier {
     _autoReconnect = false;
     _reconnectTimer?.cancel();
     _audioSub?.cancel();
+    _storageSub?.cancel();
     _batterySub?.cancel();
     _connSub?.cancel();
     _audioStreamController.close();
+    _storageStreamController.close();
     connectionState.dispose();
     batteryLevel.dispose();
     codecId.dispose();

@@ -71,6 +71,8 @@ class HomePage extends StatelessWidget {
                     )
                   else
                     _StatusCard(app: app),
+                  if (app.sdCardSync?.isSyncing.value ?? false)
+                    _SDSyncCard(app: app),
                   const SizedBox(height: 16),
                   _InfoRow(app: app),
                   const SizedBox(height: 16),
@@ -342,6 +344,54 @@ class _TranscriptList extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+class _SDSyncCard extends StatelessWidget {
+  final AppController app;
+  const _SDSyncCard({required this.app});
+
+  @override
+  Widget build(BuildContext context) {
+    final sync = app.sdCardSync;
+    if (sync == null) return const SizedBox.shrink();
+    final progress = sync.progress.value;
+    final error = sync.lastError.value;
+
+    return Card(
+      color: Theme.of(context).colorScheme.secondaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.sd_card, size: 20),
+                const SizedBox(width: 8),
+                Text('SDカード同期中...',
+                    style: Theme.of(context).textTheme.titleSmall),
+                const Spacer(),
+                Text('${(progress * 100).toStringAsFixed(0)}%',
+                    style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: progress),
+            if (error != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                error,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 12,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 }

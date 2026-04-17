@@ -4,7 +4,7 @@ import 'package:locket/services/whisper_streamer.dart';
 
 void main() {
   group('buildWhisperUri', () {
-    test('https base → wss /v4/listen with Omi query params', () {
+    test('https base → wss with token + codec + frame_header', () {
       final uri = buildWhisperUri(
         baseUrl: 'https://whisper.localai.loan',
         authToken: 'secret',
@@ -13,16 +13,10 @@ void main() {
       );
       expect(uri.scheme, 'wss');
       expect(uri.host, 'whisper.localai.loan');
-      expect(uri.path, '/v4/listen');
-      expect(uri.queryParameters['language'], 'ja');
-      expect(uri.queryParameters['sample_rate'], '16000');
+      expect(uri.path, '/');
+      expect(uri.queryParameters['token'], 'secret');
       expect(uri.queryParameters['codec'], 'opus');
-      expect(uri.queryParameters['uid'], 'dev-1');
-      expect(uri.queryParameters['include_speech_profile'], 'false');
-      expect(uri.queryParameters['conversation_timeout'], '120');
-      expect(uri.queryParameters['speaker_auto_assign'], 'enabled');
-      // Auth is via Authorization: Bearer header, not query.
-      expect(uri.queryParameters.containsKey('token'), false);
+      expect(uri.queryParameters['frame_header'], '3byte');
     });
 
     test('http base → ws', () {
@@ -35,7 +29,7 @@ void main() {
       expect(uri.scheme, 'ws');
       expect(uri.host, 'localhost');
       expect(uri.port, 8080);
-      expect(uri.path, '/v4/listen');
+      expect(uri.path, '/');
     });
 
     test('wss base stays wss', () {
@@ -55,7 +49,7 @@ void main() {
         deviceId: 'd',
         language: 'ja',
       );
-      expect(uri.path, '/v4/listen');
+      expect(uri.path, '/');
     });
   });
 

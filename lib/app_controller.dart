@@ -7,6 +7,7 @@ import 'models/transcript_segment.dart';
 import 'services/background_service.dart';
 import 'services/ios_audio_session.dart';
 import 'services/omi_device_service.dart';
+import 'services/sdcard_sync_service.dart';
 import 'services/settings_service.dart';
 import 'services/whisper_streamer.dart';
 
@@ -20,6 +21,7 @@ class AppController extends ChangeNotifier {
   final BackgroundService background;
 
   WhisperStreamer? _streamer;
+  SDCardSyncService? _sdCardSync;
   StreamSubscription<TranscriptSegment>? _transcriptSub;
   Timer? _byteRefresh;
 
@@ -45,6 +47,7 @@ class AppController extends ChangeNotifier {
   }
 
   WhisperStreamer? get streamer => _streamer;
+  SDCardSyncService? get sdCardSync => _sdCardSync;
 
   /// Returns true when the user has provided everything required for
   /// `start()` to do real work.
@@ -146,13 +149,57 @@ class AppController extends ChangeNotifier {
       _transcriptSub?.cancel();
       _transcriptSub = streamer.transcripts.listen(_onTranscript);
 
+      // Create SD card sync service.
+      _sdCardSync?.dispose();
+      _sdCardSync = SDCardSyncService(
+        device: device,
+        uploadUrl: _buildUploadUrl(),
+        authToken: settings.authToken,
+        deviceId: settings.deviceId,
+      );
+      _sdCardSync!.addListener(notifyListeners);
+
       _running = true;
       notifyListeners();
+
+      // Auto-sync SD card in the background after connection is ready.
+      _autoSyncSDCard();
     } catch (e) {
       _lastError = e.toString();
       await stop();
       notifyListeners();
     }
+  }
+
+  /// Build the SD card upload URL from baseUrl.
+  String _buildUploadUrl() {
+    var base = settings.baseUrl.trim();
+    if (base.endsWith('/')) base = base.substring(0, base.length - 1);
+    // Replace http:// with https:// for upload endpoint.
+    if (base.startsWith('http://')) {
+      base = 'https://${base.substring(7)}';
+    }
+    return '$base/sdcard/upload';
+  }
+
+  /// Auto-sync SD card after BLE connection is established.
+  void _autoSyncSDCard() {
+    final sync = _sdCardSync;
+    if (sync == null) return;
+    Future(() async {
+      try {
+        await sync.syncAll();
+      } catch (e) {
+        debugPrint('[SDSync] auto-sync error: $e');
+      }
+    });
+  }
+
+  /// Manually trigger SD card sync.
+  Future<void> syncSDCard() async {
+    final sync = _sdCardSync;
+    if (sync == null) return;
+    await sync.syncAll();
   }
 
   Future<void> stop() async {
@@ -161,6 +208,9 @@ class AppController extends ChangeNotifier {
     _byteRefresh = null;
     await _transcriptSub?.cancel();
     _transcriptSub = null;
+    _sdCardSync?.cancel();
+    _sdCardSync?.dispose();
+    _sdCardSync = null;
     await _streamer?.disconnect();
     _streamer?.dispose();
     _streamer = null;
