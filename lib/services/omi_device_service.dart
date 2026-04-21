@@ -17,6 +17,9 @@ final _storageServiceGuid = Guid('30295780-4301-eabd-2904-2849adfeae43');
 final _storageDataCharGuid = Guid('30295781-4301-eabd-2904-2849adfeae43');
 final _storageReadCtrlCharGuid = Guid('30295782-4301-eabd-2904-2849adfeae43');
 
+// SMP (Simple Management Protocol) service for MCUmgr DFU
+final _smpServiceGuid = Guid('8d53dc1d-1db7-4cd3-868b-8a527460aa84');
+
 // Standard BLE UUIDs (full 128-bit form, Bluetooth base UUID)
 final _batteryServiceGuid = Guid('0000180f-0000-1000-8000-00805f9b34fb');
 final _batteryLevelCharGuid = Guid('00002a19-0000-1000-8000-00805f9b34fb');
@@ -56,11 +59,13 @@ class OmiDeviceService extends ChangeNotifier {
   /// Notifications from the Omi storage data characteristic (30295781).
   Stream<List<int>> get storageStream => _storageStreamController.stream;
 
-  final ValueNotifier<OmiConnectionState> connectionState =
-      ValueNotifier(OmiConnectionState.disconnected);
+  final ValueNotifier<OmiConnectionState> connectionState = ValueNotifier(
+    OmiConnectionState.disconnected,
+  );
   final ValueNotifier<int> batteryLevel = ValueNotifier<int>(-1);
   final ValueNotifier<int> codecId = ValueNotifier<int>(-1);
   final ValueNotifier<String> firmwareVersion = ValueNotifier<String>('');
+  final ValueNotifier<bool> hasSmpService = ValueNotifier<bool>(false);
 
   BluetoothDevice? _device;
   StreamSubscription<List<int>>? _audioSub;
@@ -87,8 +92,9 @@ class OmiDeviceService extends ChangeNotifier {
         Permission.bluetoothConnect,
         Permission.locationWhenInUse,
       ].request();
-      return results.values
-          .every((s) => s.isGranted || s.isLimited || s.isRestricted);
+      return results.values.every(
+        (s) => s.isGranted || s.isLimited || s.isRestricted,
+      );
     }
     return true;
   }
@@ -111,12 +117,13 @@ class OmiDeviceService extends ChangeNotifier {
     // to a user-friendly Japanese message.
     final state = await FlutterBluePlus.adapterState
         .firstWhere((s) => s != BluetoothAdapterState.unknown)
-        .timeout(const Duration(seconds: 5),
-            onTimeout: () => BluetoothAdapterState.unknown);
+        .timeout(
+          const Duration(seconds: 5),
+          onTimeout: () => BluetoothAdapterState.unknown,
+        );
     switch (state) {
       case BluetoothAdapterState.unauthorized:
-        throw StateError(
-            'Bluetooth の使用が許可されていません。設定アプリで許可してください');
+        throw StateError('Bluetooth の使用が許可されていません。設定アプリで許可してください');
       case BluetoothAdapterState.off:
         throw StateError('Bluetooth がオフになっています。オンにしてください');
       case BluetoothAdapterState.unavailable:
@@ -138,13 +145,9 @@ class OmiDeviceService extends ChangeNotifier {
         final name = r.device.advName.isNotEmpty
             ? r.device.advName
             : (r.device.platformName.isNotEmpty
-                ? r.device.platformName
-                : 'Unknown');
-        discovered[id] = OmiDiscoveredDevice(
-          id: id,
-          name: name,
-          rssi: r.rssi,
-        );
+                  ? r.device.platformName
+                  : 'Unknown');
+        discovered[id] = OmiDiscoveredDevice(id: id, name: name, rssi: r.rssi);
       }
     });
 
@@ -203,6 +206,9 @@ class OmiDeviceService extends ChangeNotifier {
 
   Future<void> _discoverAndSubscribe(BluetoothDevice device) async {
     final services = await device.discoverServices();
+    // Detect SMP service for MCUmgr DFU support.
+    hasSmpService.value = services.any((s) => s.uuid == _smpServiceGuid);
+    debugPrint('[BLE] SMP service present: ${hasSmpService.value}');
     for (final service in services) {
       if (service.uuid == _audioServiceGuid) {
         for (final ch in service.characteristics) {
@@ -247,8 +253,7 @@ class OmiDeviceService extends ChangeNotifier {
           if (ch.uuid == _firmwareRevisionCharGuid) {
             try {
               final value = await ch.read();
-              firmwareVersion.value =
-                  String.fromCharCodes(value).trim();
+              firmwareVersion.value = String.fromCharCodes(value).trim();
             } catch (_) {
               // ignore read errors on optional characteristic
             }
@@ -283,10 +288,9 @@ class OmiDeviceService extends ChangeNotifier {
     if (raw.length < 4) return [];
     final result = <int>[];
     for (var i = 0; i + 3 < raw.length; i += 4) {
-      result.add(raw[i] |
-          (raw[i + 1] << 8) |
-          (raw[i + 2] << 16) |
-          (raw[i + 3] << 24));
+      result.add(
+        raw[i] | (raw[i + 1] << 8) | (raw[i + 2] << 16) | (raw[i + 3] << 24),
+      );
     }
     return result;
   }
@@ -333,10 +337,16 @@ class OmiDeviceService extends ChangeNotifier {
         for (var i = 0; i < count; i++) {
           final base = 1 + i * 8;
           if (base + 8 > value.length) break;
-          final ts = (value[base] << 24) | (value[base + 1] << 16) |
-              (value[base + 2] << 8) | value[base + 3];
-          final size = (value[base + 4] << 24) | (value[base + 5] << 16) |
-              (value[base + 6] << 8) | value[base + 7];
+          final ts =
+              (value[base] << 24) |
+              (value[base + 1] << 16) |
+              (value[base + 2] << 8) |
+              value[base + 3];
+          final size =
+              (value[base + 4] << 24) |
+              (value[base + 5] << 16) |
+              (value[base + 6] << 8) |
+              value[base + 7];
           files.add({'index': i, 'timestamp': ts, 'size': size});
         }
         debugPrint('[BLE] Listed ${files.length} storage files');
@@ -346,11 +356,13 @@ class OmiDeviceService extends ChangeNotifier {
 
     try {
       await ch.write([0x10]);
-      return await completer.future.timeout(const Duration(seconds: 10),
-          onTimeout: () {
-        debugPrint('[BLE] listStorageFiles timeout');
-        return <Map<String, int>>[];
-      });
+      return await completer.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          debugPrint('[BLE] listStorageFiles timeout');
+          return <Map<String, int>>[];
+        },
+      );
     } finally {
       await sub.cancel();
     }
@@ -450,8 +462,7 @@ class OmiDeviceService extends ChangeNotifier {
       try {
         await connect(_device!.remoteId.str);
       } catch (_) {
-        if (_autoReconnect &&
-            _reconnectAttempts < _maxReconnectAttempts) {
+        if (_autoReconnect && _reconnectAttempts < _maxReconnectAttempts) {
           _scheduleReconnect();
         }
       }
@@ -507,6 +518,7 @@ class OmiDeviceService extends ChangeNotifier {
     batteryLevel.dispose();
     codecId.dispose();
     firmwareVersion.dispose();
+    hasSmpService.dispose();
     super.dispose();
   }
 }

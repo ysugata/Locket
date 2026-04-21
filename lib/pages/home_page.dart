@@ -11,9 +11,9 @@ class HomePage extends StatelessWidget {
   const HomePage({super.key, required this.app});
 
   void _openSettings(BuildContext context) {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => SettingsPage(app: app)),
-    );
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => SettingsPage(app: app)));
   }
 
   void _showDebugLog(BuildContext context) {
@@ -76,8 +76,10 @@ class HomePage extends StatelessWidget {
                   const SizedBox(height: 16),
                   _InfoRow(app: app),
                   const SizedBox(height: 16),
-                  Text('直近の文字起こし',
-                      style: Theme.of(context).textTheme.titleMedium),
+                  Text(
+                    '直近の文字起こし',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
                   const SizedBox(height: 8),
                   Expanded(child: _TranscriptList(app: app)),
                 ],
@@ -117,8 +119,7 @@ class _StatusCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(Icons.bluetooth,
-                    color: _bleColor(context, bleState)),
+                Icon(Icons.bluetooth, color: _bleColor(context, bleState)),
                 const SizedBox(width: 8),
                 Text('BLE: ${_bleLabel(bleState)}'),
               ],
@@ -135,9 +136,9 @@ class _StatusCard extends StatelessWidget {
               const SizedBox(height: 8),
               Text(
                 _redactToken(uri),
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      fontFamily: 'monospace',
-                    ),
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
               ),
@@ -310,9 +311,11 @@ class _InfoTile extends StatelessWidget {
             const SizedBox(height: 4),
             Text(label, style: Theme.of(context).textTheme.labelSmall),
             const SizedBox(height: 4),
-            Text(value,
-                style: Theme.of(context).textTheme.titleSmall,
-                overflow: TextOverflow.ellipsis),
+            Text(
+              value,
+              style: Theme.of(context).textTheme.titleSmall,
+              overflow: TextOverflow.ellipsis,
+            ),
           ],
         ),
       ),
@@ -328,9 +331,7 @@ class _TranscriptList extends StatelessWidget {
   Widget build(BuildContext context) {
     final items = app.transcripts;
     if (items.isEmpty) {
-      return const Center(
-        child: Text('まだ文字起こしがありません'),
-      );
+      return const Center(child: Text('まだ文字起こしがありません'));
     }
     return ListView.builder(
       reverse: true,
@@ -371,11 +372,15 @@ class _SDSyncCard extends StatelessWidget {
               children: [
                 const Icon(Icons.sd_card, size: 20),
                 const SizedBox(width: 8),
-                Text('SDカード同期中...',
-                    style: Theme.of(context).textTheme.titleSmall),
+                Text(
+                  'SDカード同期中...',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
                 const Spacer(),
-                Text('${(progress * 100).toStringAsFixed(0)}%',
-                    style: Theme.of(context).textTheme.bodySmall),
+                Text(
+                  '${(progress * 100).toStringAsFixed(0)}%',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
               ],
             ),
             const SizedBox(height: 8),
@@ -430,8 +435,8 @@ class _SetupCard extends StatelessWidget {
                 Text(
                   'セットアップが必要です',
                   style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        color: scheme.onPrimaryContainer,
-                      ),
+                    color: scheme.onPrimaryContainer,
+                  ),
                 ),
               ],
             ),
@@ -513,11 +518,13 @@ class _DebugLogSheet extends StatelessWidget {
                             : () async {
                                 final text = entries.reversed.join('\n');
                                 await Clipboard.setData(
-                                    ClipboardData(text: text));
+                                  ClipboardData(text: text),
+                                );
                                 if (context.mounted) {
                                   ScaffoldMessenger.of(context).showSnackBar(
                                     const SnackBar(
-                                        content: Text('クリップボードにコピー')),
+                                      content: Text('クリップボードにコピー'),
+                                    ),
                                   );
                                 }
                               },
@@ -538,7 +545,9 @@ class _DebugLogSheet extends StatelessWidget {
                           itemCount: entries.length,
                           itemBuilder: (_, i) => Padding(
                             padding: const EdgeInsets.symmetric(
-                                horizontal: 12, vertical: 2),
+                              horizontal: 12,
+                              vertical: 2,
+                            ),
                             child: Text(
                               entries[i],
                               style: const TextStyle(

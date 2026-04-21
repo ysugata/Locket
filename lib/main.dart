@@ -17,38 +17,41 @@ Future<void> main() async {
   };
 
   // Catch uncaught async errors.
-  runZonedGuarded(() async {
-    WidgetsFlutterBinding.ensureInitialized();
+  runZonedGuarded(
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
 
-    final settings = SettingsService();
-    await settings.load();
+      final settings = SettingsService();
+      await settings.load();
 
-    final device = OmiDeviceService();
-    final background = BackgroundService()..initialize();
+      final device = OmiDeviceService();
+      final background = BackgroundService()..initialize();
 
-    final app = AppController(
-      settings: settings,
-      device: device,
-      background: background,
-    );
+      final app = AppController(
+        settings: settings,
+        device: device,
+        background: background,
+      );
 
-    runApp(LocketApp(app: app));
+      runApp(LocketApp(app: app));
 
-    // Defer auto-start to after the first frame so platform channels
-    // are ready. Wrapped in try/catch so a failed auto-start doesn't
-    // crash the app.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      Future(() async {
-        try {
-          await app.tryAutoStart();
-        } catch (e, st) {
-          debugPrint('[CRASH] tryAutoStart: $e\n$st');
-        }
+      // Defer auto-start to after the first frame so platform channels
+      // are ready. Wrapped in try/catch so a failed auto-start doesn't
+      // crash the app.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        Future(() async {
+          try {
+            await app.tryAutoStart();
+          } catch (e, st) {
+            debugPrint('[CRASH] tryAutoStart: $e\n$st');
+          }
+        });
       });
-    });
-  }, (error, stack) {
-    debugPrint('[CRASH] Uncaught: $error\n$stack');
-  });
+    },
+    (error, stack) {
+      debugPrint('[CRASH] Uncaught: $error\n$stack');
+    },
+  );
 }
 
 class LocketApp extends StatelessWidget {

@@ -99,15 +99,17 @@ class WhisperStreamer extends ChangeNotifier {
   bool _shouldBeConnected = false;
   bool _disposed = false;
 
-  final ValueNotifier<WhisperConnectionState> connectionState =
-      ValueNotifier(WhisperConnectionState.disconnected);
+  final ValueNotifier<WhisperConnectionState> connectionState = ValueNotifier(
+    WhisperConnectionState.disconnected,
+  );
 
   final ValueNotifier<String?> lastError = ValueNotifier<String?>(null);
   final ValueNotifier<int> bytesSent = ValueNotifier<int>(0);
   final ValueNotifier<int> messagesReceived = ValueNotifier<int>(0);
 
-  final ValueNotifier<List<String>> debugLog =
-      ValueNotifier<List<String>>(const []);
+  final ValueNotifier<List<String>> debugLog = ValueNotifier<List<String>>(
+    const [],
+  );
   static const int _debugLogMax = 50;
 
   void _log(String entry) {
@@ -121,8 +123,7 @@ class WhisperStreamer extends ChangeNotifier {
     debugLog.value = next;
   }
 
-  final _transcriptController =
-      StreamController<TranscriptSegment>.broadcast();
+  final _transcriptController = StreamController<TranscriptSegment>.broadcast();
   Stream<TranscriptSegment> get transcripts => _transcriptController.stream;
 
   final Queue<Uint8List> _walBuffer = Queue<Uint8List>();
@@ -139,11 +140,11 @@ class WhisperStreamer extends ChangeNotifier {
   });
 
   Uri _buildUri() => buildWhisperUri(
-        baseUrl: baseUrl,
-        authToken: authToken,
-        deviceId: deviceId,
-        language: language,
-      );
+    baseUrl: baseUrl,
+    authToken: authToken,
+    deviceId: deviceId,
+    language: language,
+  );
 
   Future<void> connect() async {
     if (_disposed) return;
@@ -170,8 +171,8 @@ class WhisperStreamer extends ChangeNotifier {
           'X-App-Platform': 'ios',
           'X-App-Version': '1.0.0',
           'X-Device-Id-Hash': deviceId,
-          'X-Request-Start-Time':
-              (DateTime.now().millisecondsSinceEpoch / 1000).toString(),
+          'X-Request-Start-Time': (DateTime.now().millisecondsSinceEpoch / 1000)
+              .toString(),
         },
         pingInterval: _pingInterval,
         connectTimeout: _connectTimeout,
@@ -186,7 +187,8 @@ class WhisperStreamer extends ChangeNotifier {
           final code = channel.closeCode;
           final reason = channel.closeReason;
           _log(
-              'closed code=$code reason=${(reason == null || reason.isEmpty) ? '(none)' : reason}');
+            'closed code=$code reason=${(reason == null || reason.isEmpty) ? '(none)' : reason}',
+          );
           if (code != null || (reason != null && reason.isNotEmpty)) {
             lastError.value =
                 'WebSocket closed (code=$code${reason == null || reason.isEmpty ? '' : ', $reason'})';
@@ -230,8 +232,9 @@ class WhisperStreamer extends ChangeNotifier {
     }
 
     if (message is String) {
-      final preview =
-          message.length > 120 ? '${message.substring(0, 120)}…' : message;
+      final preview = message.length > 120
+          ? '${message.substring(0, 120)}…'
+          : message;
       _log('recv text: $preview');
 
       try {
@@ -351,7 +354,9 @@ class WhisperStreamer extends ChangeNotifier {
           if (_silentFrameCount >= _vadHoldFrames) {
             _vadSkippedCount++;
             if (_vadSkippedCount % 500 == 0) {
-              _log('VAD: skipped=$_vadSkippedCount avg=${avg.toInt()} thresh=$threshold cur=$payloadSize');
+              _log(
+                'VAD: skipped=$_vadSkippedCount avg=${avg.toInt()} thresh=$threshold cur=$payloadSize',
+              );
             }
             return; // suppress
           }
@@ -373,7 +378,8 @@ class WhisperStreamer extends ChangeNotifier {
       try {
         if (bytesSent.value == 0) {
           _log(
-              'first audio packet ${bytes.length}B ${bytes.take(8).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}…');
+            'first audio packet ${bytes.length}B ${bytes.take(8).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}…',
+          );
         }
         channel.sink.add(bytes);
         bytesSent.value = bytesSent.value + bytes.length;

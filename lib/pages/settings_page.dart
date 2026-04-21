@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../app_controller.dart';
+import '../services/firmware_service.dart';
 import 'device_selection_page.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -41,16 +42,14 @@ class _SettingsPageState extends State<SettingsPage> {
     await s.setLanguage(_language);
     await s.setAutoReconnect(_autoReconnect);
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('保存しました')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('保存しました')));
   }
 
   Future<void> _openDeviceSelection() async {
     await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => DeviceSelectionPage(app: widget.app),
-      ),
+      MaterialPageRoute(builder: (_) => DeviceSelectionPage(app: widget.app)),
     );
     if (mounted) setState(() {});
   }
@@ -82,8 +81,7 @@ class _SettingsPageState extends State<SettingsPage> {
             decoration: InputDecoration(
               labelText: '認証トークン',
               border: const OutlineInputBorder(),
-              helperText:
-                  '現在保存されている値: ${_tokenPreview(settings.authToken)}',
+              helperText: '現在保存されている値: ${_tokenPreview(settings.authToken)}',
             ),
             autocorrect: false,
             enableSuggestions: false,
@@ -136,6 +134,8 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 24),
           _SDCardSection(app: widget.app),
           const SizedBox(height: 24),
+          _FirmwareSection(app: widget.app),
+          const SizedBox(height: 24),
           Text('その他', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
           ListTile(
@@ -143,10 +143,7 @@ class _SettingsPageState extends State<SettingsPage> {
             subtitle: Text(settings.deviceId),
           ),
           const SizedBox(height: 24),
-          FilledButton(
-            onPressed: _save,
-            child: const Text('保存'),
-          ),
+          FilledButton(onPressed: _save, child: const Text('保存')),
         ],
       ),
     );
@@ -159,6 +156,187 @@ class _SettingsPageState extends State<SettingsPage> {
     if (token.isEmpty) return '(未設定)';
     if (token.length <= 6) return '${token.length}文字';
     return '${token.substring(0, 4)}…${token.substring(token.length - 2)} (${token.length}文字)';
+  }
+}
+
+class _FirmwareSection extends StatefulWidget {
+  final AppController app;
+  const _FirmwareSection({required this.app});
+
+  @override
+  State<_FirmwareSection> createState() => _FirmwareSectionState();
+}
+
+class _FirmwareSectionState extends State<_FirmwareSection> {
+  FirmwareService? get _fw => widget.app.firmwareService;
+
+  Future<void> _check() async {
+    final fw = _fw;
+    if (fw == null) return;
+    await fw.checkLatest();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _download() async {
+    final fw = _fw;
+    if (fw == null || fw.latestInfo == null) return;
+    await fw.download(fw.latestInfo!);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _install() async {
+    final fw = _fw;
+    final zipPath = fw?.downloadedZipPath;
+    if (fw == null || zipPath == null) return;
+    final deviceId = widget.app.settings.pairedBleId;
+    if (deviceId == null) return;
+
+    // Disable auto-reconnect during DFU — disconnect is expected.
+    widget.app.device.enableAutoReconnect(false);
+
+    await fw.performUpdate(
+      deviceId,
+      zipPath,
+      hasSmpService: widget.app.device.hasSmpService.value,
+    );
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fw = _fw;
+    final currentVersion = widget.app.device.firmwareVersion.value;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('ファームウェア', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: fw == null
+                ? const Text('デバイスに接続してからアップデートを確認できます')
+                : _buildContent(context, fw, currentVersion),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildContent(
+    BuildContext context,
+    FirmwareService fw,
+    String currentVersion,
+  ) {
+    return AnimatedBuilder(
+      animation: Listenable.merge([
+        fw,
+        fw.isChecking,
+        fw.isDownloading,
+        fw.isInstalling,
+        fw.downloadProgress,
+        fw.installProgress,
+        fw.error,
+      ]),
+      builder: (context, _) {
+        final checking = fw.isChecking.value;
+        final downloading = fw.isDownloading.value;
+        final installing = fw.isInstalling.value;
+        final dlProgress = fw.downloadProgress.value;
+        final instProgress = fw.installProgress.value;
+        final errorMsg = fw.error.value;
+        final latest = fw.latestInfo;
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '現在のバージョン: '
+              '${currentVersion.isEmpty ? "不明" : currentVersion}',
+            ),
+            if (latest != null) ...[
+              const SizedBox(height: 8),
+              Text('最新バージョン: ${latest.version}'),
+              if (latest.releaseNotes != null &&
+                  latest.releaseNotes!.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(
+                  latest.releaseNotes!,
+                  style: Theme.of(context).textTheme.bodySmall,
+                  maxLines: 5,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ],
+            if (errorMsg != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                errorMsg,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 12,
+                ),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+            if (downloading) ...[
+              const SizedBox(height: 12),
+              LinearProgressIndicator(value: dlProgress / 100),
+              const SizedBox(height: 4),
+              Text(
+                'ダウンロード中... $dlProgress%',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+            if (installing) ...[
+              const SizedBox(height: 12),
+              LinearProgressIndicator(value: instProgress / 100),
+              const SizedBox(height: 4),
+              Text(
+                'インストール中... $instProgress%',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                if (!downloading && !installing)
+                  FilledButton.tonalIcon(
+                    onPressed: checking ? null : _check,
+                    icon: checking
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.refresh),
+                    label: const Text('アップデートを確認'),
+                  ),
+                if (latest != null &&
+                    !fw.hasDownloadedFirmware &&
+                    !downloading &&
+                    !installing)
+                  FilledButton.tonalIcon(
+                    onPressed: _download,
+                    icon: const Icon(Icons.download),
+                    label: const Text('ダウンロード'),
+                  ),
+                if (fw.hasDownloadedFirmware && !installing && !downloading)
+                  FilledButton.icon(
+                    onPressed: _install,
+                    icon: const Icon(Icons.system_update),
+                    label: const Text('インストール'),
+                  ),
+              ],
+            ),
+          ],
+        );
+      },
+    );
   }
 }
 
@@ -196,8 +374,10 @@ class _SDCardSection extends StatelessWidget {
                   const SizedBox(height: 12),
                   LinearProgressIndicator(value: progress),
                   const SizedBox(height: 4),
-                  Text('${(progress * 100).toStringAsFixed(1)}%',
-                      style: Theme.of(context).textTheme.bodySmall),
+                  Text(
+                    '${(progress * 100).toStringAsFixed(1)}%',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
                 ],
                 if (error != null) ...[
                   const SizedBox(height: 8),

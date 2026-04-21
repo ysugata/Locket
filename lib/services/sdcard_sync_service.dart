@@ -119,7 +119,9 @@ class SDCardSyncService extends ChangeNotifier {
     final files = await device.listStorageFiles();
     debugPrint('[SDSync] listStorageFiles: ${files.length} files');
     for (final f in files) {
-      debugPrint('[SDSync]   index=${f['index']} ts=${f['timestamp']} size=${f['size']}');
+      debugPrint(
+        '[SDSync]   index=${f['index']} ts=${f['timestamp']} size=${f['size']}',
+      );
     }
 
     if (files.isEmpty) {
@@ -181,12 +183,15 @@ class SDCardSyncService extends ChangeNotifier {
     final completer = Completer<void>();
     _activeCompleter = completer;
 
-    _storageSub = device.storageStream.listen((value) {
-      if (_cancelled) return;
-      _parseNotification(value, frames, completer);
-    }, onError: (Object e) {
-      if (!completer.isCompleted) completer.completeError(e);
-    });
+    _storageSub = device.storageStream.listen(
+      (value) {
+        if (_cancelled) return;
+        _parseNotification(value, frames, completer);
+      },
+      onError: (Object e) {
+        if (!completer.isCompleted) completer.completeError(e);
+      },
+    );
 
     void onBleState() {
       if (device.connectionState.value == OmiConnectionState.disconnected) {
@@ -219,20 +224,22 @@ class SDCardSyncService extends ChangeNotifier {
     final frames = <Uint8List>[];
     final completer = Completer<void>();
 
-    _storageSub = device.storageStream.listen((value) {
-      if (_cancelled) return;
-      _parseNotification(value, frames, completer);
-      if (totalBytesOnCard > 0) {
-        int receivedBytes = 0;
-        for (final f in frames) {
-          receivedBytes += f.length;
+    _storageSub = device.storageStream.listen(
+      (value) {
+        if (_cancelled) return;
+        _parseNotification(value, frames, completer);
+        if (totalBytesOnCard > 0) {
+          int receivedBytes = 0;
+          for (final f in frames) {
+            receivedBytes += f.length;
+          }
+          progress.value = (receivedBytes / totalBytesOnCard).clamp(0.0, 1.0);
         }
-        progress.value =
-            (receivedBytes / totalBytesOnCard).clamp(0.0, 1.0);
-      }
-    }, onError: (Object e) {
-      if (!completer.isCompleted) completer.completeError(e);
-    });
+      },
+      onError: (Object e) {
+        if (!completer.isCompleted) completer.completeError(e);
+      },
+    );
 
     void onBleState() {
       if (device.connectionState.value == OmiConnectionState.disconnected) {
@@ -288,7 +295,10 @@ class SDCardSyncService extends ChangeNotifier {
   /// 1-byte notifications are command responses (0=OK, 4=empty, 0x64=END).
   /// 6-byte notifications matching our write echo are ignored.
   void _parseNotification(
-      List<int> value, List<Uint8List> frames, Completer<void> completer) {
+    List<int> value,
+    List<Uint8List> frames,
+    Completer<void> completer,
+  ) {
     if (value.length == 1) {
       final code = value[0];
       if (code == 0x64) {
@@ -300,8 +310,7 @@ class SDCardSyncService extends ChangeNotifier {
         debugPrint('[SDSync] Empty file');
         if (!completer.isCompleted) completer.complete();
       } else if (code != 0) {
-        debugPrint(
-            '[SDSync] response code: 0x${code.toRadixString(16)}');
+        debugPrint('[SDSync] response code: 0x${code.toRadixString(16)}');
         if (!completer.isCompleted) completer.complete();
       }
       return;
@@ -348,14 +357,17 @@ class SDCardSyncService extends ChangeNotifier {
     if (current.isNotEmpty) chunks.add(current);
 
     debugPrint(
-        '[SDSync] Uploading ${frames.length} frames in ${chunks.length} chunks');
+      '[SDSync] Uploading ${frames.length} frames in ${chunks.length} chunks',
+    );
 
     for (var i = 0; i < chunks.length; i++) {
       if (_cancelled) return false;
       final chunk = chunks[i];
       final body = _encodeLengthPrefixed(chunk);
-      debugPrint('[SDSync] Chunk ${i + 1}/${chunks.length}: '
-          '${chunk.length} frames (${body.length} B)');
+      debugPrint(
+        '[SDSync] Chunk ${i + 1}/${chunks.length}: '
+        '${chunk.length} frames (${body.length} B)',
+      );
 
       final timestampStart = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final uri = Uri.parse('$uploadUrl?token=$authToken');
@@ -379,7 +391,8 @@ class SDCardSyncService extends ChangeNotifier {
         lastError.value =
             'Upload failed: HTTP ${response.statusCode} (chunk ${i + 1})';
         debugPrint(
-            '[SDSync] Upload error: ${response.statusCode} ${response.body}');
+          '[SDSync] Upload error: ${response.statusCode} ${response.body}',
+        );
         return false;
       }
     }
@@ -406,7 +419,6 @@ class SDCardSyncService extends ChangeNotifier {
     }
     return result;
   }
-
 
   @override
   void dispose() {

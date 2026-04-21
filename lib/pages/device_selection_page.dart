@@ -46,10 +46,7 @@ class _DeviceSelectionPageState extends State<DeviceSelectionPage> {
   }
 
   Future<void> _pair(OmiDiscoveredDevice device) async {
-    await widget.app.settings.setPairedDevice(
-      id: device.id,
-      name: device.name,
-    );
+    await widget.app.settings.setPairedDevice(id: device.id, name: device.name);
     if (!mounted) return;
     Navigator.of(context).pop();
   }

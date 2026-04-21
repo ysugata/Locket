@@ -73,7 +73,10 @@ class SettingsService extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> setPairedDevice({required String id, required String name}) async {
+  Future<void> setPairedDevice({
+    required String id,
+    required String name,
+  }) async {
     _pairedBleId = id;
     _pairedBleName = name;
     await _prefs.setString(_kPairedBleId, id);

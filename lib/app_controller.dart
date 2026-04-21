@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 
 import 'models/transcript_segment.dart';
 import 'services/background_service.dart';
+import 'services/firmware_service.dart';
 import 'services/ios_audio_session.dart';
 import 'services/omi_device_service.dart';
 import 'services/sdcard_sync_service.dart';
@@ -22,6 +23,7 @@ class AppController extends ChangeNotifier {
 
   WhisperStreamer? _streamer;
   SDCardSyncService? _sdCardSync;
+  FirmwareService? _firmwareService;
   StreamSubscription<TranscriptSegment>? _transcriptSub;
   Timer? _byteRefresh;
 
@@ -48,6 +50,7 @@ class AppController extends ChangeNotifier {
 
   WhisperStreamer? get streamer => _streamer;
   SDCardSyncService? get sdCardSync => _sdCardSync;
+  FirmwareService? get firmwareService => _firmwareService;
 
   /// Returns true when the user has provided everything required for
   /// `start()` to do real work.
@@ -88,12 +91,12 @@ class AppController extends ChangeNotifier {
   }
 
   String _settingsFingerprint() => [
-        settings.baseUrl,
-        settings.authToken,
-        settings.language,
-        settings.pairedBleId ?? '',
-        settings.autoReconnect.toString(),
-      ].join('|');
+    settings.baseUrl,
+    settings.authToken,
+    settings.language,
+    settings.pairedBleId ?? '',
+    settings.autoReconnect.toString(),
+  ].join('|');
 
   /// Starts BLE + WebSocket relay and the foreground service.
   /// Requires a paired BLE device id and a non-empty auth token.
@@ -148,6 +151,12 @@ class AppController extends ChangeNotifier {
 
       _transcriptSub?.cancel();
       _transcriptSub = streamer.transcripts.listen(_onTranscript);
+
+      // Create firmware update service.
+      _firmwareService?.dispose();
+      _firmwareService = FirmwareService()
+        ..currentVersion = device.firmwareVersion.value
+        ..addListener(notifyListeners);
 
       // Create SD card sync service.
       _sdCardSync?.dispose();
@@ -211,6 +220,8 @@ class AppController extends ChangeNotifier {
     _sdCardSync?.cancel();
     _sdCardSync?.dispose();
     _sdCardSync = null;
+    _firmwareService?.dispose();
+    _firmwareService = null;
     await _streamer?.disconnect();
     _streamer?.dispose();
     _streamer = null;
