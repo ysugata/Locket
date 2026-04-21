@@ -1,10 +1,12 @@
 import AVFoundation
 import Flutter
+import NetworkExtension
 import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var audioSessionChannel: FlutterMethodChannel?
+  private var wifiChannel: FlutterMethodChannel?
 
   override func application(
     _ application: UIApplication,
@@ -61,5 +63,63 @@ import UIKit
       }
     }
     audioSessionChannel = channel
+
+    // WiFi method channel for SoftAP connection.
+    guard let wifiRegistrar = engineBridge.pluginRegistry.registrar(forPlugin: "LocketWiFi") else {
+      return
+    }
+    let wifi = FlutterMethodChannel(
+      name: "com.ys.locket/wifi",
+      binaryMessenger: wifiRegistrar.messenger()
+    )
+    wifi.setMethodCallHandler { (call, result) in
+      switch call.method {
+      case "connectToAp":
+        guard let args = call.arguments as? [String: Any],
+              let ssid = args["ssid"] as? String,
+              let password = args["password"] as? String else {
+          result(FlutterError(
+            code: "INVALID_ARGS",
+            message: "ssid and password are required",
+            details: nil
+          ))
+          return
+        }
+        let config = NEHotspotConfiguration(ssid: ssid, passphrase: password, isWEP: false)
+        config.joinOnce = true
+        NEHotspotConfigurationManager.shared.apply(config) { error in
+          if let error = error as NSError? {
+            // Error code 13 = "already associated", treat as success.
+            if error.domain == NEHotspotConfigurationErrorDomain &&
+               error.code == NEHotspotConfigurationError.alreadyAssociated.rawValue {
+              result(true)
+            } else {
+              result(FlutterError(
+                code: "WIFI_ERROR",
+                message: error.localizedDescription,
+                details: nil
+              ))
+            }
+          } else {
+            result(true)
+          }
+        }
+      case "disconnectFromAp":
+        guard let args = call.arguments as? [String: Any],
+              let ssid = args["ssid"] as? String else {
+          result(FlutterError(
+            code: "INVALID_ARGS",
+            message: "ssid is required",
+            details: nil
+          ))
+          return
+        }
+        NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
+        result(true)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+    wifiChannel = wifi
   }
 }

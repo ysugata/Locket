@@ -16,6 +16,7 @@ final _codecTypeCharGuid = Guid('19b10002-e8f2-537e-4f6c-d104768a1214');
 final _storageServiceGuid = Guid('30295780-4301-eabd-2904-2849adfeae43');
 final _storageDataCharGuid = Guid('30295781-4301-eabd-2904-2849adfeae43');
 final _storageReadCtrlCharGuid = Guid('30295782-4301-eabd-2904-2849adfeae43');
+final _storageWifiCharGuid = Guid('30295783-4301-eabd-2904-2849adfeae43');
 
 // SMP (Simple Management Protocol) service for MCUmgr DFU
 final _smpServiceGuid = Guid('8d53dc1d-1db7-4cd3-868b-8a527460aa84');
@@ -51,6 +52,7 @@ class OmiDeviceService extends ChangeNotifier {
 
   final _audioStreamController = StreamController<Uint8List>.broadcast();
   final _storageStreamController = StreamController<List<int>>.broadcast();
+  final _wifiStreamController = StreamController<List<int>>.broadcast();
 
   /// Raw BLE notifications from the Omi audio data characteristic.
   /// Bytes include the 3-byte Omi packet header — do not strip.
@@ -58,6 +60,9 @@ class OmiDeviceService extends ChangeNotifier {
 
   /// Notifications from the Omi storage data characteristic (30295781).
   Stream<List<int>> get storageStream => _storageStreamController.stream;
+
+  /// Notifications from the WiFi control characteristic (30295783).
+  Stream<List<int>> get wifiStream => _wifiStreamController.stream;
 
   final ValueNotifier<OmiConnectionState> connectionState = ValueNotifier(
     OmiConnectionState.disconnected,
@@ -70,11 +75,13 @@ class OmiDeviceService extends ChangeNotifier {
   BluetoothDevice? _device;
   StreamSubscription<List<int>>? _audioSub;
   StreamSubscription<List<int>>? _storageSub;
+  StreamSubscription<List<int>>? _wifiSub;
   StreamSubscription<List<int>>? _batterySub;
   StreamSubscription<BluetoothConnectionState>? _connSub;
 
   BluetoothCharacteristic? _storageDataChar;
   BluetoothCharacteristic? _storageReadCtrlChar;
+  BluetoothCharacteristic? _wifiChar;
 
   bool _autoReconnect = true;
   int _reconnectAttempts = 0;
@@ -273,6 +280,17 @@ class OmiDeviceService extends ChangeNotifier {
             });
           } else if (ch.uuid == _storageReadCtrlCharGuid) {
             _storageReadCtrlChar = ch;
+          } else if (ch.uuid == _storageWifiCharGuid) {
+            _wifiChar = ch;
+            await ch.setNotifyValue(true);
+            await _wifiSub?.cancel();
+            _wifiSub = ch.lastValueStream.listen((value) {
+              if (value.isNotEmpty) {
+                debugPrint('[BLE] wifi char notify len=${value.length}');
+                _wifiStreamController.add(value);
+              }
+            });
+            debugPrint('[BLE] WiFi characteristic discovered');
           }
         }
       }
@@ -440,6 +458,105 @@ class OmiDeviceService extends ChangeNotifier {
     await ch.write([0x12, fileIndex & 0xFF], withoutResponse: false);
   }
 
+  /// Whether the WiFi control characteristic (30295783) was discovered.
+  bool get hasWifiCharacteristic => _wifiChar != null;
+
+  /// Setup WiFi AP on the device.
+  /// Writes [0x01, ssid_len, ssid_bytes..., password_len, password_bytes...]
+  /// to the WiFi characteristic (30295783).
+  /// Returns true if the device responds with 0 (success).
+  Future<bool> setupWifiSync(String ssid, String password) async {
+    final ch = _wifiChar;
+    if (ch == null) {
+      throw StateError('WiFi characteristic not available');
+    }
+    final ssidBytes = ssid.codeUnits;
+    final passwordBytes = password.codeUnits;
+    final cmd = <int>[
+      0x01,
+      ssidBytes.length,
+      ...ssidBytes,
+      passwordBytes.length,
+      ...passwordBytes,
+    ];
+    debugPrint('[BLE] setupWifiSync: ssid=$ssid cmd_len=${cmd.length}');
+
+    final completer = Completer<bool>();
+    StreamSubscription<List<int>>? sub;
+    sub = wifiStream.listen((value) {
+      if (completer.isCompleted) return;
+      if (value.length == 1) {
+        completer.complete(value[0] == 0);
+      }
+    });
+
+    try {
+      await ch.write(cmd);
+      return await completer.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => false,
+      );
+    } finally {
+      await sub.cancel();
+    }
+  }
+
+  /// Start WiFi AP on the device. Writes [0x02].
+  /// Returns true if the device responds with 0 (success).
+  Future<bool> startWifiSync() async {
+    final ch = _wifiChar;
+    if (ch == null) {
+      throw StateError('WiFi characteristic not available');
+    }
+    debugPrint('[BLE] startWifiSync');
+
+    final completer = Completer<bool>();
+    StreamSubscription<List<int>>? sub;
+    sub = wifiStream.listen((value) {
+      if (completer.isCompleted) return;
+      if (value.length == 1) {
+        completer.complete(value[0] == 0);
+      }
+    });
+
+    try {
+      await ch.write([0x02]);
+      return await completer.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => false,
+      );
+    } finally {
+      await sub.cancel();
+    }
+  }
+
+  /// Stop WiFi AP on the device. Writes [0x03].
+  /// Returns true if the device responds with 0 (success).
+  Future<bool> stopWifiSync() async {
+    final ch = _wifiChar;
+    if (ch == null) return false;
+    debugPrint('[BLE] stopWifiSync');
+
+    final completer = Completer<bool>();
+    StreamSubscription<List<int>>? sub;
+    sub = wifiStream.listen((value) {
+      if (completer.isCompleted) return;
+      if (value.length == 1) {
+        completer.complete(value[0] == 0);
+      }
+    });
+
+    try {
+      await ch.write([0x03]);
+      return await completer.future.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => false,
+      );
+    } finally {
+      await sub.cancel();
+    }
+  }
+
   void _handleDisconnection() {
     if (_disposed) return;
     if (connectionState.value == OmiConnectionState.disconnected) return;
@@ -477,8 +594,11 @@ class OmiDeviceService extends ChangeNotifier {
     _audioSub = null;
     await _storageSub?.cancel();
     _storageSub = null;
+    await _wifiSub?.cancel();
+    _wifiSub = null;
     _storageDataChar = null;
     _storageReadCtrlChar = null;
+    _wifiChar = null;
     await _batterySub?.cancel();
     _batterySub = null;
     await _connSub?.cancel();
@@ -510,10 +630,12 @@ class OmiDeviceService extends ChangeNotifier {
     _reconnectTimer?.cancel();
     _audioSub?.cancel();
     _storageSub?.cancel();
+    _wifiSub?.cancel();
     _batterySub?.cancel();
     _connSub?.cancel();
     _audioStreamController.close();
     _storageStreamController.close();
+    _wifiStreamController.close();
     connectionState.dispose();
     batteryLevel.dispose();
     codecId.dispose();

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../app_controller.dart';
 import '../services/firmware_service.dart';
+import '../services/wifi_sync_service.dart';
 import 'device_selection_page.dart';
 
 class SettingsPage extends StatefulWidget {
@@ -134,6 +135,8 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 24),
           _SDCardSection(app: widget.app),
           const SizedBox(height: 24),
+          _WifiSyncSection(app: widget.app),
+          const SizedBox(height: 24),
           _FirmwareSection(app: widget.app),
           const SizedBox(height: 24),
           Text('その他', style: Theme.of(context).textTheme.titleMedium),
@@ -156,6 +159,113 @@ class _SettingsPageState extends State<SettingsPage> {
     if (token.isEmpty) return '(未設定)';
     if (token.length <= 6) return '${token.length}文字';
     return '${token.substring(0, 4)}…${token.substring(token.length - 2)} (${token.length}文字)';
+  }
+}
+
+class _WifiSyncSection extends StatelessWidget {
+  final AppController app;
+  const _WifiSyncSection({required this.app});
+
+  String _stateLabel(WifiSyncState s) {
+    switch (s) {
+      case WifiSyncState.idle:
+        return '待機中';
+      case WifiSyncState.settingUp:
+        return 'AP設定中...';
+      case WifiSyncState.connecting:
+        return 'WiFi接続中...';
+      case WifiSyncState.transferring:
+        return 'データ転送中...';
+      case WifiSyncState.uploading:
+        return 'アップロード中...';
+      case WifiSyncState.done:
+        return '完了';
+      case WifiSyncState.error:
+        return 'エラー';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sync = app.wifiSync;
+    final isAvailable = sync?.isAvailable ?? false;
+    final syncState = sync?.state.value ?? WifiSyncState.idle;
+    final syncing = sync?.isSyncing ?? false;
+    final progress = sync?.progress.value ?? 0.0;
+    final speed = sync?.speedKBps.value ?? 0.0;
+    final errorMsg = sync?.error.value;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('WiFi同期', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (!isAvailable)
+                  const Text('デバイスがWiFi同期に対応していません')
+                else ...[
+                  Text('状態: ${_stateLabel(syncState)}'),
+                  if (syncing) ...[
+                    const SizedBox(height: 12),
+                    LinearProgressIndicator(value: progress),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Text(
+                          '${(progress * 100).toStringAsFixed(1)}%',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        if (speed > 0) ...[
+                          const Spacer(),
+                          Text(
+                            '${speed.toStringAsFixed(1)} KB/s',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ],
+                  if (errorMsg != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      errorMsg,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                        fontSize: 12,
+                      ),
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      FilledButton.tonalIcon(
+                        onPressed: syncing ? null : () => app.syncWifi(),
+                        icon: const Icon(Icons.wifi),
+                        label: const Text('WiFi同期を開始'),
+                      ),
+                      if (syncing) ...[
+                        const SizedBox(width: 8),
+                        TextButton(
+                          onPressed: () => sync?.cancel(),
+                          child: const Text('キャンセル'),
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
   }
 }
 

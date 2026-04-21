@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../app_controller.dart';
 import '../services/omi_device_service.dart';
 import '../services/whisper_streamer.dart';
+import '../services/wifi_sync_service.dart';
 import 'settings_page.dart';
 
 class HomePage extends StatelessWidget {
@@ -73,6 +74,7 @@ class HomePage extends StatelessWidget {
                     _StatusCard(app: app),
                   if (app.sdCardSync?.isSyncing.value ?? false)
                     _SDSyncCard(app: app),
+                  if (app.wifiSync?.isSyncing ?? false) _WifiSyncCard(app: app),
                   const SizedBox(height: 16),
                   _InfoRow(app: app),
                   const SizedBox(height: 16),
@@ -389,6 +391,92 @@ class _SDSyncCard extends StatelessWidget {
               const SizedBox(height: 8),
               Text(
                 error,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 12,
+                ),
+              ),
+            ],
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: () => sync.cancel(),
+              icon: const Icon(Icons.cancel, size: 16),
+              label: const Text('キャンセル'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _WifiSyncCard extends StatelessWidget {
+  final AppController app;
+  const _WifiSyncCard({required this.app});
+
+  String _stateLabel(WifiSyncState s) {
+    switch (s) {
+      case WifiSyncState.idle:
+        return '待機中';
+      case WifiSyncState.settingUp:
+        return 'AP設定中...';
+      case WifiSyncState.connecting:
+        return 'WiFi接続中...';
+      case WifiSyncState.transferring:
+        return 'データ転送中...';
+      case WifiSyncState.uploading:
+        return 'アップロード中...';
+      case WifiSyncState.done:
+        return '完了';
+      case WifiSyncState.error:
+        return 'エラー';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sync = app.wifiSync;
+    if (sync == null) return const SizedBox.shrink();
+    final syncState = sync.state.value;
+    final progress = sync.progress.value;
+    final speed = sync.speedKBps.value;
+    final errorMsg = sync.error.value;
+
+    return Card(
+      color: Theme.of(context).colorScheme.tertiaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.wifi, size: 20),
+                const SizedBox(width: 8),
+                Text(
+                  'WiFi同期: ${_stateLabel(syncState)}',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const Spacer(),
+                Text(
+                  '${(progress * 100).toStringAsFixed(0)}%',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: progress),
+            if (speed > 0) ...[
+              const SizedBox(height: 4),
+              Text(
+                '${speed.toStringAsFixed(1)} KB/s',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+            if (errorMsg != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                errorMsg,
                 style: TextStyle(
                   color: Theme.of(context).colorScheme.error,
                   fontSize: 12,

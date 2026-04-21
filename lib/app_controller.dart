@@ -11,6 +11,7 @@ import 'services/omi_device_service.dart';
 import 'services/sdcard_sync_service.dart';
 import 'services/settings_service.dart';
 import 'services/whisper_streamer.dart';
+import 'services/wifi_sync_service.dart';
 
 /// Wires the BLE, WebSocket, and foreground-service layers together
 /// and exposes a single surface the UI can watch.
@@ -23,6 +24,7 @@ class AppController extends ChangeNotifier {
 
   WhisperStreamer? _streamer;
   SDCardSyncService? _sdCardSync;
+  WifiSyncService? _wifiSync;
   FirmwareService? _firmwareService;
   StreamSubscription<TranscriptSegment>? _transcriptSub;
   Timer? _byteRefresh;
@@ -50,6 +52,7 @@ class AppController extends ChangeNotifier {
 
   WhisperStreamer? get streamer => _streamer;
   SDCardSyncService? get sdCardSync => _sdCardSync;
+  WifiSyncService? get wifiSync => _wifiSync;
   FirmwareService? get firmwareService => _firmwareService;
 
   /// Returns true when the user has provided everything required for
@@ -168,6 +171,16 @@ class AppController extends ChangeNotifier {
       );
       _sdCardSync!.addListener(notifyListeners);
 
+      // Create WiFi sync service (only usable if device has WiFi char).
+      _wifiSync?.dispose();
+      _wifiSync = WifiSyncService(
+        device: device,
+        uploadUrl: _buildUploadUrl(),
+        authToken: settings.authToken,
+        deviceId: settings.deviceId,
+      );
+      _wifiSync!.addListener(notifyListeners);
+
       _running = true;
       notifyListeners();
 
@@ -211,6 +224,13 @@ class AppController extends ChangeNotifier {
     await sync.syncAll();
   }
 
+  /// Manually trigger WiFi sync.
+  Future<void> syncWifi() async {
+    final sync = _wifiSync;
+    if (sync == null) return;
+    await sync.sync();
+  }
+
   Future<void> stop() async {
     _running = false;
     _byteRefresh?.cancel();
@@ -220,6 +240,9 @@ class AppController extends ChangeNotifier {
     _sdCardSync?.cancel();
     _sdCardSync?.dispose();
     _sdCardSync = null;
+    await _wifiSync?.cancel();
+    _wifiSync?.dispose();
+    _wifiSync = null;
     _firmwareService?.dispose();
     _firmwareService = null;
     await _streamer?.disconnect();
