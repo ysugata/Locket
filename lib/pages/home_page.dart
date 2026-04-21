@@ -145,7 +145,8 @@ class _StatusCard extends StatelessWidget {
             if (streamer != null) ...[
               const SizedBox(height: 8),
               Text(
-                '送信 ${_formatBytes(sent)} / 受信 $received メッセージ',
+                '送信 ${_formatBytes(sent)} / 受信 $received メッセージ'
+                '${streamer.vadSkippedCount > 0 ? ' / VAD ${streamer.vadSkippedCount} skip' : ''}',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ],

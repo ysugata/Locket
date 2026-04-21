@@ -303,13 +303,47 @@ class WhisperStreamer extends ChangeNotifier {
     }
   }
 
+  /// OPUS frame-size-based VAD: frames below this threshold (bytes,
+  /// excluding the 3-byte Omi header) are considered silence / DTX
+  /// and skipped to save bandwidth. Typical speech frames are 40-130
+  /// bytes; silence/comfort noise are 1-15 bytes.
+  /// Set to 0 to disable VAD.
+  static const int _vadThresholdBytes = 20;
+
+  /// Consecutive silent frames needed before suppression starts.
+  /// Prevents clipping the beginning of speech.
+  static const int _vadHoldFrames = 5;
+
+  int _silentFrameCount = 0;
+  int _vadSkippedCount = 0;
+
+  /// Number of frames skipped by VAD since the streamer was created.
+  int get vadSkippedCount => _vadSkippedCount;
+
   /// Forwards BLE bytes verbatim — the user's bridge URL has
   /// `frame_header=3byte` and strips the 3-byte Omi packet header
   /// server-side, so Locket must NOT strip it on the client.
+  ///
+  /// VAD: skips frames whose OPUS payload is below _vadThresholdBytes,
+  /// but only after _vadHoldFrames consecutive silent frames (to
+  /// avoid clipping speech onsets).
   void streamAudio(Stream<Uint8List> audioStream) {
     _audioSub?.cancel();
     _audioSub = audioStream.listen((bytes) {
       if (bytes.length <= omiBleHeaderSize) return;
+
+      // VAD: check OPUS payload size (excluding 3-byte Omi header).
+      final payloadSize = bytes.length - omiBleHeaderSize;
+      if (_vadThresholdBytes > 0 && payloadSize < _vadThresholdBytes) {
+        _silentFrameCount++;
+        if (_silentFrameCount >= _vadHoldFrames) {
+          _vadSkippedCount++;
+          return; // suppress silent frame
+        }
+      } else {
+        _silentFrameCount = 0;
+      }
+
       _sendOrBuffer(bytes);
     });
   }
