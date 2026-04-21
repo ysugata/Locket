@@ -7,10 +7,21 @@ import 'omi_device_service.dart';
 
 /// Syncs OPUS audio stored on the Omi CV1's SD card to the server.
 ///
-/// The storage BLE protocol uses three response shapes:
-/// - len == 1: command response (0=OK, 4=empty, 0x64=END, other=error)
-/// - len == 83: single frame [3-byte header][amount:1][frame:amount]
-/// - len == 440: batch of frames, each [size:1][frame:size]
+/// Supports both legacy (single-file) and new multi-file protocols.
+/// The protocol is auto-detected from storageInfo: if field[1] < 1000,
+/// it's the new multi-file protocol (field[1] = fileCount); if >= 1000,
+/// it's the legacy protocol (field[1] = byte offset).
+///
+/// New multi-file protocol commands:
+///   0x10 = CMD_LIST_FILES
+///   0x11 = CMD_READ_FILE(fileIndex)
+///   0x12 = CMD_DELETE_FILE(fileIndex)
+///   0x03 = CMD_STOP
+///
+/// Data notification shapes:
+///   len == 1: command response (0=OK, 4=empty, 0x64=END)
+///   len == 83: single frame [header:3][amount:1][frame:amount]
+///   len >= 2 (other): batch of [size:1][frame:size]...
 class SDCardSyncService extends ChangeNotifier {
   final OmiDeviceService device;
   final String uploadUrl;
@@ -32,12 +43,18 @@ class SDCardSyncService extends ChangeNotifier {
     required this.deviceId,
   });
 
-  /// Cancel an in-progress sync.
+  Completer<void>? _activeCompleter;
+
+  /// Cancel an in-progress sync immediately.
   void cancel() {
     _cancelled = true;
+    if (_activeCompleter != null && !_activeCompleter!.isCompleted) {
+      _activeCompleter!.complete();
+    }
+    _storageSub?.cancel();
+    _storageSub = null;
   }
 
-  /// Sync all SD card data: read frames via BLE, upload, then clear.
   Future<void> syncAll() async {
     if (isSyncing.value) return;
     _cancelled = false;
@@ -47,133 +64,301 @@ class SDCardSyncService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      // 1. Read storage list to determine total bytes.
+      // Stop any in-progress storage operation.
+      await device.stopStorageSync();
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+
+      // Read storage info.
       final storageInfo = await device.getStorageList();
+      debugPrint('[SDSync] storageInfo: $storageInfo');
       if (storageInfo.isEmpty) {
-        lastError.value = 'Storage info not available';
+        lastError.value = 'ストレージ情報が取得できません';
         return;
       }
       totalBytesOnCard = storageInfo[0];
+      final field1 = storageInfo.length > 1 ? storageInfo[1] : 0;
       notifyListeners();
 
-      // 2. Skip if essentially empty (< 100 bytes).
       if (totalBytesOnCard < 100) {
-        debugPrint('[SDSync] No meaningful data on card ($totalBytesOnCard B)');
+        debugPrint('[SDSync] No meaningful data ($totalBytesOnCard B)');
         return;
       }
 
-      final storageOffset = storageInfo.length > 1 ? storageInfo[1] : 0;
-      final timestampStart =
-          DateTime.now().millisecondsSinceEpoch ~/ 1000;
-
-      // 3. Accumulate frames from storage stream notifications.
-      final frames = <Uint8List>[];
-      int receivedBytes = 0;
-      final completer = Completer<void>();
-
-      _storageSub = device.storageStream.listen((value) {
-        if (_cancelled) return;
-
-        if (value.length == 1) {
-          // Command response byte.
-          final code = value[0];
-          if (code == 0x64) {
-            // END — all frames received.
-            if (!completer.isCompleted) completer.complete();
-          } else if (code == 4) {
-            // Empty storage.
-            if (!completer.isCompleted) completer.complete();
-          } else if (code != 0) {
-            // Error.
-            if (!completer.isCompleted) {
-              completer.completeError(
-                  StateError('Storage read error: 0x${code.toRadixString(16)}'));
-            }
-          }
-          // code == 0 means OK, continue reading.
-        } else if (value.length == 83) {
-          // Single frame: value[3] = amount, value[4..4+amount] = frame.
-          final amount = value[3];
-          if (amount > 0 && 4 + amount <= value.length) {
-            final frame =
-                Uint8List.fromList(value.sublist(4, 4 + amount));
-            frames.add(frame);
-            receivedBytes += frame.length;
-            if (totalBytesOnCard > 0) {
-              progress.value =
-                  (receivedBytes / totalBytesOnCard).clamp(0.0, 1.0);
-            }
-          }
-        } else if (value.length >= 2) {
-          // Batch: sequence of [size:1][frame:size] entries.
-          var pos = 0;
-          while (pos < value.length) {
-            final size = value[pos];
-            pos++;
-            if (size == 0 || pos + size > value.length) break;
-            final frame =
-                Uint8List.fromList(value.sublist(pos, pos + size));
-            frames.add(frame);
-            receivedBytes += frame.length;
-            pos += size;
-          }
-          if (totalBytesOnCard > 0) {
-            progress.value =
-                (receivedBytes / totalBytesOnCard).clamp(0.0, 1.0);
-          }
-        }
-      }, onError: (Object e) {
-        if (!completer.isCompleted) completer.completeError(e);
-      });
-
-      // Also abort if BLE disconnects.
-      void onBleState() {
-        if (device.connectionState.value == OmiConnectionState.disconnected) {
-          if (!completer.isCompleted) {
-            completer
-                .completeError(StateError('BLE disconnected during SD sync'));
-          }
-        }
+      // CV1 firmware uses the new multi-file protocol (CMD_READ_FILE
+      // 0x11, CMD_DELETE_FILE 0x12). Legacy command 0x00 returns 0x06.
+      // field1 < 1000 → new firmware (field1 = fileCount).
+      // field1 >= 1000 → old firmware (field1 = byte offset, use legacy).
+      if (field1 < 1000) {
+        debugPrint('[SDSync] multi-file: $field1 files, $totalBytesOnCard B');
+        await _syncMultiFile(field1);
+      } else {
+        debugPrint('[SDSync] legacy: offset=$field1');
+        await _syncLegacy(field1);
       }
+    } catch (e) {
+      lastError.value = e.toString();
+      debugPrint('[SDSync] error: $e');
+    } finally {
+      await _storageSub?.cancel();
+      _storageSub = null;
+      // (audio notifications are left running during SD sync)
+      isSyncing.value = false;
+      notifyListeners();
+    }
+  }
 
-      device.connectionState.addListener(onBleState);
+  /// New multi-file protocol: list files, read each non-empty file,
+  /// upload, then delete.
+  Future<void> _syncMultiFile(int fileCount) async {
+    if (fileCount == 0) {
+      debugPrint('[SDSync] No files to sync');
+      return;
+    }
 
-      // 4. Send read command.
-      await device.writeStorageCommand(0x00, 1, storageOffset);
+    // Get actual file list with sizes.
+    final files = await device.listStorageFiles();
+    debugPrint('[SDSync] listStorageFiles: ${files.length} files');
+    for (final f in files) {
+      debugPrint('[SDSync]   index=${f['index']} ts=${f['timestamp']} size=${f['size']}');
+    }
 
-      // 5. Wait for END or error (timeout after 5 minutes).
-      try {
-        await completer.future.timeout(const Duration(minutes: 5));
-      } on TimeoutException {
-        lastError.value = 'SD sync timed out';
-        return;
-      } finally {
-        device.connectionState.removeListener(onBleState);
-        await _storageSub?.cancel();
-        _storageSub = null;
-      }
+    if (files.isEmpty) {
+      debugPrint('[SDSync] No files returned by CMD_LIST_FILES');
+      return;
+    }
 
-      if (_cancelled) {
-        // Send stop command.
-        try {
-          await device.writeStorageCommand(0x03, 1, 0);
-        } catch (_) {}
-        lastError.value = 'Sync cancelled';
-        return;
-      }
+    // Filter to non-empty files only and recalculate total.
+    final nonEmpty = files.where((f) => (f['size'] ?? 0) > 0).toList();
+    int actualTotal = 0;
+    for (final f in nonEmpty) {
+      actualTotal += f['size'] ?? 0;
+    }
+    totalBytesOnCard = actualTotal;
+    debugPrint('[SDSync] ${nonEmpty.length} non-empty files, $actualTotal B');
 
+    int filesProcessed = 0;
+    final totalFiles = nonEmpty.length;
+    for (final file in nonEmpty) {
+      if (_cancelled) break;
+      final idx = file['index'] ?? 0;
+      final size = file['size'] ?? 0;
+      debugPrint('[SDSync] Reading file $idx (${size}B)');
+      // File-based progress: each file is an equal slice.
+      progress.value = (filesProcessed / totalFiles).clamp(0.0, 0.99);
+      notifyListeners();
+
+      final frames = await _readFile(idx);
+      if (_cancelled) break;
       if (frames.isEmpty) {
-        debugPrint('[SDSync] No frames received from SD card');
-        return;
+        debugPrint('[SDSync] File $idx: 0 frames, skipping');
+        continue;
       }
 
-      // 6. Encode as length-prefixed binary.
-      progress.value = 0.95;
-      final body = _encodeLengthPrefixed(frames);
+      final ok = await _uploadFrames(frames);
+      if (!ok) return;
 
-      // 7. HTTP POST upload.
-      final uri =
-          Uri.parse('$uploadUrl?token=${Uri.encodeQueryComponent(authToken)}');
+      // Delete file from device after successful upload.
+      try {
+        await device.deleteStorageFile(idx);
+        debugPrint('[SDSync] Deleted file $idx');
+      } catch (e) {
+        debugPrint('[SDSync] Delete file $idx failed: $e');
+      }
+      filesProcessed++;
+      progress.value = (filesProcessed / totalFiles).clamp(0.0, 0.99);
+      notifyListeners();
+    }
+
+    totalBytesOnCard = 0;
+    progress.value = 1.0;
+    notifyListeners();
+    debugPrint('[SDSync] multi-file complete: $filesProcessed files');
+  }
+
+  /// Read one file using CMD_READ_FILE (0x11, fileIndex, offset=0).
+  Future<List<Uint8List>> _readFile(int index) async {
+    final frames = <Uint8List>[];
+    final completer = Completer<void>();
+    _activeCompleter = completer;
+
+    _storageSub = device.storageStream.listen((value) {
+      if (_cancelled) return;
+      _parseNotification(value, frames, completer);
+    }, onError: (Object e) {
+      if (!completer.isCompleted) completer.completeError(e);
+    });
+
+    void onBleState() {
+      if (device.connectionState.value == OmiConnectionState.disconnected) {
+        if (!completer.isCompleted) {
+          completer.completeError(StateError('BLE disconnected'));
+        }
+      }
+    }
+
+    device.connectionState.addListener(onBleState);
+
+    try {
+      await device.readStorageFile(index, offset: 0);
+      await completer.future.timeout(const Duration(seconds: 30));
+    } on TimeoutException {
+      debugPrint('[SDSync] Read file $index timed out');
+    } finally {
+      device.connectionState.removeListener(onBleState);
+      await _storageSub?.cancel();
+      _storageSub = null;
+    }
+
+    debugPrint('[SDSync] File $index: ${frames.length} frames');
+    return frames;
+  }
+
+  /// Legacy single-file protocol: command 0x00 with offset.
+  Future<void> _syncLegacy(int storageOffset) async {
+    debugPrint('[SDSync] legacy: offset=$storageOffset');
+    final frames = <Uint8List>[];
+    final completer = Completer<void>();
+
+    _storageSub = device.storageStream.listen((value) {
+      if (_cancelled) return;
+      _parseNotification(value, frames, completer);
+      if (totalBytesOnCard > 0) {
+        int receivedBytes = 0;
+        for (final f in frames) {
+          receivedBytes += f.length;
+        }
+        progress.value =
+            (receivedBytes / totalBytesOnCard).clamp(0.0, 1.0);
+      }
+    }, onError: (Object e) {
+      if (!completer.isCompleted) completer.completeError(e);
+    });
+
+    void onBleState() {
+      if (device.connectionState.value == OmiConnectionState.disconnected) {
+        if (!completer.isCompleted) {
+          completer.completeError(StateError('BLE disconnected'));
+        }
+      }
+    }
+
+    device.connectionState.addListener(onBleState);
+
+    try {
+      await device.writeStorageCommand(0x00, 1, storageOffset);
+      await completer.future.timeout(const Duration(seconds: 30));
+    } on TimeoutException {
+      lastError.value = 'SD sync timed out';
+      return;
+    } finally {
+      device.connectionState.removeListener(onBleState);
+      await _storageSub?.cancel();
+      _storageSub = null;
+    }
+
+    if (_cancelled) {
+      try {
+        await device.stopStorageSync();
+      } catch (_) {}
+      lastError.value = 'Sync cancelled';
+      return;
+    }
+
+    if (frames.isEmpty) {
+      debugPrint('[SDSync] No frames received');
+      return;
+    }
+
+    final ok = await _uploadFrames(frames);
+    if (!ok) return;
+
+    // Clear SD card on success.
+    await device.writeStorageCommand(0x01, 1, 0);
+    totalBytesOnCard = 0;
+    progress.value = 1.0;
+    notifyListeners();
+  }
+
+  /// Parse a BLE notification and extract OPUS frames.
+  ///
+  /// New multi-file protocol notifications have a 4-byte BE timestamp
+  /// prefix followed by a batch of [size:1][frame:size]... entries.
+  /// Typical notification size is 444 bytes (4 ts + 440 batch).
+  ///
+  /// 1-byte notifications are command responses (0=OK, 4=empty, 0x64=END).
+  /// 6-byte notifications matching our write echo are ignored.
+  void _parseNotification(
+      List<int> value, List<Uint8List> frames, Completer<void> completer) {
+    if (value.length == 1) {
+      final code = value[0];
+      if (code == 0x64) {
+        // END
+        debugPrint('[SDSync] END received');
+        if (!completer.isCompleted) completer.complete();
+      } else if (code == 4) {
+        // Empty
+        debugPrint('[SDSync] Empty file');
+        if (!completer.isCompleted) completer.complete();
+      } else if (code != 0) {
+        debugPrint(
+            '[SDSync] response code: 0x${code.toRadixString(16)}');
+        if (!completer.isCompleted) completer.complete();
+      }
+      return;
+    }
+
+    // Skip write echoes (our own CMD_READ_FILE echoed back).
+    if (value.length == 6 && value[0] == 0x11) return;
+
+    // New protocol: [timestamp:4 BE][batch of [size:1][frame:size]...]
+    if (value.length > 4) {
+      // Skip 4-byte timestamp prefix.
+      var pos = 4;
+      while (pos < value.length) {
+        final size = value[pos];
+        pos++;
+        if (size == 0 || pos + size > value.length) break;
+        frames.add(Uint8List.fromList(value.sublist(pos, pos + size)));
+        pos += size;
+      }
+    }
+  }
+
+  /// Upload frames via HTTP POST to /sdcard/upload.
+  /// Chunks large payloads to stay under Cloudflare Tunnel limits.
+  static const int _maxChunkBytes = 500 * 1024;
+
+  Future<bool> _uploadFrames(List<Uint8List> frames) async {
+    if (frames.isEmpty) return true;
+
+    // Split into chunks.
+    final chunks = <List<Uint8List>>[];
+    var current = <Uint8List>[];
+    var currentSize = 0;
+    for (final f in frames) {
+      final entrySize = 4 + f.length;
+      if (currentSize + entrySize > _maxChunkBytes && current.isNotEmpty) {
+        chunks.add(current);
+        current = <Uint8List>[];
+        currentSize = 0;
+      }
+      current.add(f);
+      currentSize += entrySize;
+    }
+    if (current.isNotEmpty) chunks.add(current);
+
+    debugPrint(
+        '[SDSync] Uploading ${frames.length} frames in ${chunks.length} chunks');
+
+    for (var i = 0; i < chunks.length; i++) {
+      if (_cancelled) return false;
+      final chunk = chunks[i];
+      final body = _encodeLengthPrefixed(chunk);
+      debugPrint('[SDSync] Chunk ${i + 1}/${chunks.length}: '
+          '${chunk.length} frames (${body.length} B)');
+
+      final timestampStart = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final uri = Uri.parse('$uploadUrl?token=$authToken');
       final response = await http.post(
         uri,
         headers: {
@@ -192,26 +377,17 @@ class SDCardSyncService extends ChangeNotifier {
 
       if (response.statusCode != 200) {
         lastError.value =
-            'Upload failed: HTTP ${response.statusCode} ${response.body}';
-        return;
+            'Upload failed: HTTP ${response.statusCode} (chunk ${i + 1})';
+        debugPrint(
+            '[SDSync] Upload error: ${response.statusCode} ${response.body}');
+        return false;
       }
-
-      // 8. Clear SD card on success.
-      await device.writeStorageCommand(0x01, 1, 0);
-      totalBytesOnCard = 0;
-      progress.value = 1.0;
-      notifyListeners();
-    } catch (e) {
-      lastError.value = e.toString();
-    } finally {
-      await _storageSub?.cancel();
-      _storageSub = null;
-      isSyncing.value = false;
-      notifyListeners();
     }
+
+    debugPrint('[SDSync] All ${chunks.length} chunks uploaded');
+    return true;
   }
 
-  /// Encode frames as [4-byte LE length][frame] sequences.
   Uint8List _encodeLengthPrefixed(List<Uint8List> frames) {
     var totalSize = 0;
     for (final f in frames) {
@@ -230,6 +406,7 @@ class SDCardSyncService extends ChangeNotifier {
     }
     return result;
   }
+
 
   @override
   void dispose() {

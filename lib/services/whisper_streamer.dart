@@ -291,6 +291,18 @@ class WhisperStreamer extends ChangeNotifier {
     _reconnectTimer = Timer(delay, _openChannel);
   }
 
+  /// Send raw bytes directly on the WebSocket (used by SD sync to
+  /// stream stored OPUS frames through the same WS connection).
+  void sendRaw(Uint8List bytes) {
+    final channel = _channel;
+    if (channel != null &&
+        connectionState.value == WhisperConnectionState.connected) {
+      try {
+        channel.sink.add(bytes);
+      } catch (_) {}
+    }
+  }
+
   /// Forwards BLE bytes verbatim — the user's bridge URL has
   /// `frame_header=3byte` and strips the 3-byte Omi packet header
   /// server-side, so Locket must NOT strip it on the client.

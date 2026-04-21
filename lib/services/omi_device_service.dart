@@ -207,6 +207,7 @@ class OmiDeviceService extends ChangeNotifier {
       if (service.uuid == _audioServiceGuid) {
         for (final ch in service.characteristics) {
           if (ch.uuid == _audioDataCharGuid) {
+            _audioDataChar = ch;
             await ch.setNotifyValue(true);
             await _audioSub?.cancel();
             _audioSub = ch.lastValueStream.listen((value) {
@@ -261,6 +262,7 @@ class OmiDeviceService extends ChangeNotifier {
             await _storageSub?.cancel();
             _storageSub = ch.lastValueStream.listen((value) {
               if (value.isNotEmpty) {
+                debugPrint('[BLE] storage raw notify len=${value.length}');
                 _storageStreamController.add(value);
               }
             });
@@ -289,10 +291,8 @@ class OmiDeviceService extends ChangeNotifier {
     return result;
   }
 
-  /// Write a storage command to the data characteristic (30295781).
+  /// Write a legacy storage command to the data characteristic.
   /// [command]: 0x00 = start read, 0x01 = clear, 0x03 = stop.
-  /// [fileNum]: file number (typically 1).
-  /// [offset]: 4-byte big-endian read offset.
   Future<void> writeStorageCommand(int command, int fileNum, int offset) async {
     final ch = _storageDataChar;
     if (ch == null) {
@@ -305,7 +305,127 @@ class OmiDeviceService extends ChangeNotifier {
     bytes[3] = (offset >> 16) & 0xFF;
     bytes[4] = (offset >> 8) & 0xFF;
     bytes[5] = offset & 0xFF;
-    await ch.write(bytes, withoutResponse: false);
+    await ch.write(bytes);
+  }
+
+  /// Send CMD_LIST_FILES (0x10) and return the file list.
+  /// Response: [count:1][ts:4 BE][size:4 BE]... per file.
+  Future<List<Map<String, int>>> listStorageFiles() async {
+    final ch = _storageDataChar;
+    if (ch == null) return [];
+
+    final completer = Completer<List<Map<String, int>>>();
+    StreamSubscription<List<int>>? sub;
+
+    sub = storageStream.listen((value) {
+      if (completer.isCompleted) return;
+      if (value.isEmpty) return;
+
+      final count = value[0];
+      if (count == 0 && value.length == 1) {
+        completer.complete([]);
+        return;
+      }
+
+      final expectedLen = 1 + count * 8;
+      if (value.length >= expectedLen && count > 0 && count <= 128) {
+        final files = <Map<String, int>>[];
+        for (var i = 0; i < count; i++) {
+          final base = 1 + i * 8;
+          if (base + 8 > value.length) break;
+          final ts = (value[base] << 24) | (value[base + 1] << 16) |
+              (value[base + 2] << 8) | value[base + 3];
+          final size = (value[base + 4] << 24) | (value[base + 5] << 16) |
+              (value[base + 6] << 8) | value[base + 7];
+          files.add({'index': i, 'timestamp': ts, 'size': size});
+        }
+        debugPrint('[BLE] Listed ${files.length} storage files');
+        completer.complete(files);
+      }
+    });
+
+    try {
+      await ch.write([0x10]);
+      return await completer.future.timeout(const Duration(seconds: 10),
+          onTimeout: () {
+        debugPrint('[BLE] listStorageFiles timeout');
+        return <Map<String, int>>[];
+      });
+    } finally {
+      await sub.cancel();
+    }
+  }
+
+  /// Send CMD_STOP (0x03) to abort any in-progress storage operation.
+  Future<void> stopStorageSync() async {
+    final ch = _storageDataChar;
+    if (ch == null) return;
+    await ch.write([0x03]);
+  }
+
+  BluetoothCharacteristic? _audioDataChar;
+
+  /// Pause audio notifications so the device can serve storage reads.
+  /// CV1 can't do both simultaneously (returns 0x06 if audio is active).
+  Future<void> pauseAudioNotifications() async {
+    if (_audioDataChar != null) {
+      await _audioSub?.cancel();
+      _audioSub = null;
+      try {
+        await _audioDataChar!.setNotifyValue(false);
+      } catch (_) {}
+      debugPrint('[BLE] Audio notifications paused');
+    }
+  }
+
+  /// Resume audio notifications after storage sync is done.
+  Future<void> resumeAudioNotifications() async {
+    if (_audioDataChar != null) {
+      try {
+        await _audioDataChar!.setNotifyValue(true);
+        _audioSub = _audioDataChar!.lastValueStream.listen((value) {
+          if (value.isNotEmpty) {
+            _audioStreamController.add(Uint8List.fromList(value));
+          }
+        });
+      } catch (_) {}
+      debugPrint('[BLE] Audio notifications resumed');
+    }
+  }
+
+  /// Send CMD_READ_FILE (0x11) — new multi-file protocol.
+  /// Format: [0x11, file_index, offset(4 bytes BE)].
+  /// Data frames arrive on [storageStream]. Listen before calling.
+  Future<void> readStorageFile(int fileIndex, {int offset = 0}) async {
+    final ch = _storageDataChar;
+    if (ch == null) {
+      throw StateError('Storage data characteristic not available');
+    }
+    final cmd = [
+      0x11,
+      fileIndex & 0xFF,
+      (offset >> 24) & 0xFF,
+      (offset >> 16) & 0xFF,
+      (offset >> 8) & 0xFF,
+      offset & 0xFF,
+    ];
+    debugPrint('[BLE] Writing CMD_READ_FILE: $cmd');
+    try {
+      await ch.write(cmd);
+      debugPrint('[BLE] CMD_READ_FILE write OK');
+    } catch (e) {
+      debugPrint('[BLE] CMD_READ_FILE write FAILED: $e');
+      rethrow;
+    }
+  }
+
+  /// Send CMD_DELETE_FILE (0x12, fileIndex) — new multi-file protocol.
+  Future<void> deleteStorageFile(int fileIndex) async {
+    final ch = _storageDataChar;
+    if (ch == null) {
+      throw StateError('Storage data characteristic not available');
+    }
+    await ch.write([0x12, fileIndex & 0xFF], withoutResponse: false);
   }
 
   void _handleDisconnection() {

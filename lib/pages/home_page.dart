@@ -389,6 +389,12 @@ class _SDSyncCard extends StatelessWidget {
                 ),
               ),
             ],
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: () => sync.cancel(),
+              icon: const Icon(Icons.cancel, size: 16),
+              label: const Text('キャンセル'),
+            ),
           ],
         ),
       ),
