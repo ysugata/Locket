@@ -135,8 +135,11 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 24),
           _SDCardSection(app: widget.app),
           const SizedBox(height: 24),
-          _WifiSyncSection(app: widget.app),
-          const SizedBox(height: 24),
+          // WiFi sync section: only shown when device supports it.
+          if (widget.app.wifiSync?.isAvailable ?? false) ...[
+            _WifiSyncSection(app: widget.app),
+            const SizedBox(height: 24),
+          ],
           _FirmwareSection(app: widget.app),
           const SizedBox(height: 24),
           Text('その他', style: Theme.of(context).textTheme.titleMedium),
