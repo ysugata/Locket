@@ -159,10 +159,20 @@ class SDCardSyncService extends ChangeNotifier {
       final ok = await _uploadFrames(frames);
       if (!ok) return;
 
+      // Stop any in-progress read before deleting — the read may have
+      // timed out, leaving the device still streaming data.
+      await device.stopStorageSync();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
       // Delete file from device after successful upload.
+      // Wait for device confirmation (single-byte 0x00 response).
       try {
-        await device.deleteStorageFile(idx);
-        debugPrint('[SDSync] Deleted file $idx');
+        final deleted = await device.deleteStorageFile(idx);
+        if (deleted) {
+          debugPrint('[SDSync] Deleted file $idx');
+        } else {
+          debugPrint('[SDSync] Delete file $idx: device returned failure');
+        }
       } catch (e) {
         debugPrint('[SDSync] Delete file $idx failed: $e');
       }

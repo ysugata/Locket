@@ -450,12 +450,35 @@ class OmiDeviceService extends ChangeNotifier {
   }
 
   /// Send CMD_DELETE_FILE (0x12, fileIndex) — new multi-file protocol.
-  Future<void> deleteStorageFile(int fileIndex) async {
+  /// Waits for a single-byte response (0x00 = success) with 5s timeout.
+  Future<bool> deleteStorageFile(int fileIndex) async {
     final ch = _storageDataChar;
     if (ch == null) {
       throw StateError('Storage data characteristic not available');
     }
+
+    final completer = Completer<bool>();
+    StreamSubscription<List<int>>? sub;
+    Timer? timeout;
+
+    sub = storageStream.listen((value) {
+      if (value.length == 1) {
+        sub?.cancel();
+        timeout?.cancel();
+        completer.complete(value[0] == 0x00);
+      }
+    });
+
+    timeout = Timer(const Duration(seconds: 5), () {
+      sub?.cancel();
+      if (!completer.isCompleted) {
+        debugPrint('[BLE] CMD_DELETE_FILE timeout for index $fileIndex');
+        completer.complete(false);
+      }
+    });
+
     await ch.write([0x12, fileIndex & 0xFF], withoutResponse: false);
+    return completer.future;
   }
 
   /// Whether the WiFi control characteristic (30295783) was discovered.
