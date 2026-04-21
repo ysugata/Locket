@@ -303,17 +303,17 @@ class WhisperStreamer extends ChangeNotifier {
     }
   }
 
-  /// OPUS frame-size-based VAD: frames below this threshold (bytes,
-  /// excluding the 3-byte Omi header) are considered silence / DTX
-  /// and skipped to save bandwidth. Typical speech frames are 40-130
-  /// bytes; silence/comfort noise are 1-15 bytes.
-  /// Set to 0 to disable VAD.
-  static const int _vadThresholdBytes = 20;
+  /// Adaptive VAD: compares each frame's OPUS payload size against
+  /// a rolling average. CV1 doesn't use OPUS DTX, so silence frames
+  /// are still 60-70 bytes (vs 80-150 for speech). Frames below
+  /// `rollingAvg * _vadRatio` for `_vadHoldFrames` consecutive frames
+  /// are considered silence and skipped.
+  static const double _vadRatio = 0.78;
+  static const int _vadHoldFrames = 50; // ~1 second at 50fps
+  static const int _vadWindowSize = 500; // ~10 seconds
 
-  /// Consecutive silent frames needed before suppression starts.
-  /// Prevents clipping the beginning of speech.
-  static const int _vadHoldFrames = 5;
-
+  final List<int> _vadWindow = [];
+  int _vadWindowSum = 0;
   int _silentFrameCount = 0;
   int _vadSkippedCount = 0;
 
@@ -332,16 +332,32 @@ class WhisperStreamer extends ChangeNotifier {
     _audioSub = audioStream.listen((bytes) {
       if (bytes.length <= omiBleHeaderSize) return;
 
-      // VAD: check OPUS payload size (excluding 3-byte Omi header).
       final payloadSize = bytes.length - omiBleHeaderSize;
-      if (_vadThresholdBytes > 0 && payloadSize < _vadThresholdBytes) {
-        _silentFrameCount++;
-        if (_silentFrameCount >= _vadHoldFrames) {
-          _vadSkippedCount++;
-          return; // suppress silent frame
+
+      // Update rolling window for adaptive threshold.
+      _vadWindow.add(payloadSize);
+      _vadWindowSum += payloadSize;
+      if (_vadWindow.length > _vadWindowSize) {
+        _vadWindowSum -= _vadWindow.removeAt(0);
+      }
+
+      // Need enough samples before VAD kicks in.
+      if (_vadWindow.length >= 100) {
+        final avg = _vadWindowSum / _vadWindow.length;
+        final threshold = (avg * _vadRatio).toInt();
+
+        if (payloadSize < threshold) {
+          _silentFrameCount++;
+          if (_silentFrameCount >= _vadHoldFrames) {
+            _vadSkippedCount++;
+            if (_vadSkippedCount % 500 == 0) {
+              _log('VAD: skipped=$_vadSkippedCount avg=${avg.toInt()} thresh=$threshold cur=$payloadSize');
+            }
+            return; // suppress
+          }
+        } else {
+          _silentFrameCount = 0;
         }
-      } else {
-        _silentFrameCount = 0;
       }
 
       _sendOrBuffer(bytes);

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'app_controller.dart';
@@ -8,29 +10,44 @@ import 'services/settings_service.dart';
 import 'theme/app_theme.dart';
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
+  // Catch uncaught Flutter framework errors.
+  FlutterError.onError = (details) {
+    debugPrint('[CRASH] FlutterError: ${details.exception}');
+    debugPrint('${details.stack}');
+  };
 
-  final settings = SettingsService();
-  await settings.load();
+  // Catch uncaught async errors.
+  runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
 
-  final device = OmiDeviceService();
-  final background = BackgroundService()..initialize();
+    final settings = SettingsService();
+    await settings.load();
 
-  final app = AppController(
-    settings: settings,
-    device: device,
-    background: background,
-  );
+    final device = OmiDeviceService();
+    final background = BackgroundService()..initialize();
 
-  runApp(LocketApp(app: app));
+    final app = AppController(
+      settings: settings,
+      device: device,
+      background: background,
+    );
 
-  // Defer auto-start to after the first frame: BLE / foreground
-  // service / iOS audio session method channels are only fully
-  // wired up once the engine has rendered. Calling start() before
-  // that races against the platform side and silently fails on iOS.
-  WidgetsBinding.instance.addPostFrameCallback((_) {
-    // ignore: unawaited_futures, discarded_futures
-    app.tryAutoStart();
+    runApp(LocketApp(app: app));
+
+    // Defer auto-start to after the first frame so platform channels
+    // are ready. Wrapped in try/catch so a failed auto-start doesn't
+    // crash the app.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      Future(() async {
+        try {
+          await app.tryAutoStart();
+        } catch (e, st) {
+          debugPrint('[CRASH] tryAutoStart: $e\n$st');
+        }
+      });
+    });
+  }, (error, stack) {
+    debugPrint('[CRASH] Uncaught: $error\n$stack');
   });
 }
 
