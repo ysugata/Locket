@@ -323,6 +323,18 @@ class WhisperStreamer extends ChangeNotifier {
   /// Number of frames skipped by VAD since the streamer was created.
   int get vadSkippedCount => _vadSkippedCount;
 
+  // Packet gap detection using the Omi 3-byte header:
+  // [packet_id_low, packet_id_high, fragment_index]
+  int _lastPacketId = -1;
+  int _gapCount = 0;
+  int _totalGapFrames = 0;
+
+  /// Number of detected packet ID gaps (potential audio drops).
+  int get gapCount => _gapCount;
+
+  /// Total number of missing frames across all gaps.
+  int get totalGapFrames => _totalGapFrames;
+
   /// Forwards BLE bytes verbatim — the user's bridge URL has
   /// `frame_header=3byte` and strips the 3-byte Omi packet header
   /// server-side, so Locket must NOT strip it on the client.
@@ -334,6 +346,23 @@ class WhisperStreamer extends ChangeNotifier {
     _audioSub?.cancel();
     _audioSub = audioStream.listen((bytes) {
       if (bytes.length <= omiBleHeaderSize) return;
+
+      // Detect packet gaps from the Omi 3-byte header.
+      // bytes[0] = packet_id_low, bytes[1] = packet_id_high
+      final packetId = bytes[0] | (bytes[1] << 8);
+      if (_lastPacketId >= 0) {
+        final expected = (_lastPacketId + 1) & 0xFFFF;
+        if (packetId != expected) {
+          final gap = (packetId - expected) & 0xFFFF;
+          // Ignore huge gaps (likely reconnect, not drop)
+          if (gap < 1000) {
+            _gapCount++;
+            _totalGapFrames += gap;
+            _log('GAP: expected=$expected got=$packetId missing=$gap frames (total gaps=$_gapCount, total missing=$_totalGapFrames)');
+          }
+        }
+      }
+      _lastPacketId = packetId;
 
       final payloadSize = bytes.length - omiBleHeaderSize;
 
