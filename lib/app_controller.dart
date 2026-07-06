@@ -58,6 +58,7 @@ class AppController extends ChangeNotifier {
   SDCardSyncService? get sdCardSync => _sdCardSync;
   WifiSyncService? get wifiSync => _wifiSync;
   FirmwareService? get firmwareService => _firmwareService;
+  WalStore? get walStore => _walStore;
 
   /// Returns true when the user has provided everything required for
   /// `start()` to do real work.

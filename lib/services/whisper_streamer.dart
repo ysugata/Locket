@@ -79,7 +79,7 @@ class WhisperStreamer extends ChangeNotifier {
   static const Duration _pingInterval = Duration(seconds: 20);
   static const Duration _connectTimeout = Duration(seconds: 15);
   static const Duration _initialBackoff = Duration(seconds: 5);
-  static const Duration _maxBackoff = Duration(seconds: 60);
+  static const Duration _maxBackoff = Duration(seconds: 30);
 
   /// In-memory offline buffer cap (~12 minutes of 16 kHz mono OPUS at
   /// ~80 bytes / 10 ms). Old packets are dropped oldest-first when the

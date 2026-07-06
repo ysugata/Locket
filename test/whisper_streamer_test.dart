@@ -1,6 +1,19 @@
+import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:locket/models/transcript_segment.dart';
 import 'package:locket/services/whisper_streamer.dart';
+
+/// Builds a fake Omi BLE notification: [id_low, id_high, frag] + payload.
+Uint8List omiPacket(int packetId, {int payloadSize = 80}) {
+  return Uint8List.fromList([
+    packetId & 0xFF,
+    (packetId >> 8) & 0xFF,
+    0,
+    ...List.filled(payloadSize, 0x42),
+  ]);
+}
 
 void main() {
   group('buildWhisperUri', () {
@@ -56,6 +69,68 @@ void main() {
   group('omiBleHeaderSize', () {
     test('matches Omi firmware: 2 bytes packet id + 1 byte fragment idx', () {
       expect(omiBleHeaderSize, 3);
+    });
+  });
+
+  group('packet gap detection', () {
+    late WhisperStreamer streamer;
+    late StreamController<Uint8List> audio;
+
+    setUp(() {
+      streamer = WhisperStreamer(
+        baseUrl: 'https://example.com',
+        authToken: 't',
+        deviceId: 'd',
+      );
+      audio = StreamController<Uint8List>();
+      streamer.streamAudio(audio.stream);
+    });
+
+    tearDown(() async {
+      await audio.close();
+      streamer.dispose();
+    });
+
+    test('consecutive packet ids report no gap', () async {
+      for (var id = 0; id < 10; id++) {
+        audio.add(omiPacket(id));
+      }
+      await Future<void>.delayed(Duration.zero);
+      expect(streamer.gapCount, 0);
+      expect(streamer.totalGapFrames, 0);
+    });
+
+    test('a missing packet id is counted as a gap', () async {
+      audio.add(omiPacket(1));
+      audio.add(omiPacket(2));
+      audio.add(omiPacket(6)); // 3,4,5 missing
+      await Future<void>.delayed(Duration.zero);
+      expect(streamer.gapCount, 1);
+      expect(streamer.totalGapFrames, 3);
+    });
+
+    test('16-bit packet id wraparound is not a gap', () async {
+      audio.add(omiPacket(0xFFFE));
+      audio.add(omiPacket(0xFFFF));
+      audio.add(omiPacket(0x0000));
+      audio.add(omiPacket(0x0001));
+      await Future<void>.delayed(Duration.zero);
+      expect(streamer.gapCount, 0);
+    });
+
+    test('huge jumps (device reboot) are ignored', () async {
+      audio.add(omiPacket(10));
+      audio.add(omiPacket(5000));
+      await Future<void>.delayed(Duration.zero);
+      expect(streamer.gapCount, 0);
+    });
+
+    test('offline frames land in the memory WAL buffer', () async {
+      audio.add(omiPacket(1, payloadSize: 80));
+      audio.add(omiPacket(2, payloadSize: 80));
+      await Future<void>.delayed(Duration.zero);
+      // 2 packets × (3B header + 80B payload), never sent — buffered.
+      expect(streamer.walBufferedBytes, 2 * 83);
     });
   });
 
