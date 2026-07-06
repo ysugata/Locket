@@ -174,6 +174,17 @@ class _StatusCard extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
               ),
             ],
+            if (bleState == OmiConnectionState.disconnected) ...[
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerRight,
+                child: FilledButton.tonalIcon(
+                  onPressed: () => app.retryConnect(),
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: const Text('再接続'),
+                ),
+              ),
+            ],
           ],
         ),
       ),

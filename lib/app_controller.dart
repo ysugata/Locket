@@ -17,6 +17,7 @@ import 'services/wifi_sync_service.dart';
 /// and exposes a single surface the UI can watch.
 class AppController extends ChangeNotifier {
   static const int _maxTranscriptHistory = 50;
+  static const Duration _startRetryDelay = Duration(seconds: 30);
 
   final SettingsService settings;
   final OmiDeviceService device;
@@ -28,6 +29,7 @@ class AppController extends ChangeNotifier {
   FirmwareService? _firmwareService;
   StreamSubscription<TranscriptSegment>? _transcriptSub;
   Timer? _byteRefresh;
+  Timer? _startRetryTimer;
 
   final Queue<TranscriptSegment> _transcripts = Queue<TranscriptSegment>();
   List<TranscriptSegment> get transcripts => List.unmodifiable(_transcripts);
@@ -105,6 +107,8 @@ class AppController extends ChangeNotifier {
   /// Requires a paired BLE device id and a non-empty auth token.
   Future<void> start() async {
     if (_running) return;
+    _startRetryTimer?.cancel();
+    _startRetryTimer = null;
     _lastError = null;
 
     final bleId = settings.pairedBleId;
@@ -126,6 +130,15 @@ class AppController extends ChangeNotifier {
       await background.start();
       device.enableAutoReconnect(settings.autoReconnect);
       await device.connect(bleId);
+
+      // The relay assumes OPUS; anything else would be transcribed as
+      // garbage server-side, so surface it prominently.
+      final codec = device.codecId.value;
+      if (codec >= 0 && codec != omiCodecOpus) {
+        _lastError =
+            'デバイスのコーデックがOPUSではありません (id=$codec)。'
+            '文字起こしが正しく動作しない可能性があります';
+      }
 
       final streamer = WhisperStreamer(
         baseUrl: settings.baseUrl,
@@ -189,7 +202,44 @@ class AppController extends ChangeNotifier {
     } catch (e) {
       _lastError = e.toString();
       await stop();
+      // The device may simply be out of range or powered off right
+      // now (e.g. app launched before putting the wearable on).
+      // Keep retrying instead of staying dead until a settings change.
+      _scheduleStartRetry();
       notifyListeners();
+    }
+  }
+
+  void _scheduleStartRetry() {
+    _startRetryTimer?.cancel();
+    if (!isConfigured) return;
+    _startRetryTimer = Timer(_startRetryDelay, () {
+      if (_running) return;
+      debugPrint('[App] retrying start() after failure');
+      start();
+    });
+  }
+
+  /// Manual retry from the UI: restarts the relay when stopped, or
+  /// kicks an immediate BLE reconnect when the relay is running but
+  /// the device link is down.
+  Future<void> retryConnect() async {
+    _startRetryTimer?.cancel();
+    _startRetryTimer = null;
+    if (!_running) {
+      await start();
+      return;
+    }
+    final bleId = settings.pairedBleId;
+    if (bleId == null || bleId.isEmpty) return;
+    if (device.connectionState.value == OmiConnectionState.disconnected ||
+        device.connectionState.value == OmiConnectionState.reconnecting) {
+      try {
+        await device.connect(bleId);
+      } catch (e) {
+        _lastError = e.toString();
+        notifyListeners();
+      }
     }
   }
 
@@ -233,6 +283,8 @@ class AppController extends ChangeNotifier {
 
   Future<void> stop() async {
     _running = false;
+    _startRetryTimer?.cancel();
+    _startRetryTimer = null;
     _byteRefresh?.cancel();
     _byteRefresh = null;
     await _transcriptSub?.cancel();
