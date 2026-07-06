@@ -47,8 +47,12 @@ enum OmiConnectionState {
 class OmiDeviceService extends ChangeNotifier {
   static const _scanTimeout = Duration(seconds: 10);
   static const _connectTimeout = Duration(seconds: 15);
-  static const _reconnectDelay = Duration(seconds: 15);
-  static const _maxReconnectAttempts = 10;
+  // Reconnect retries forever (a wearable must survive hours out of
+  // range): 3s → 6s → 12s → 24s → 30s cap, reset on success. The
+  // official omi app likewise has no attempt limit.
+  static const _reconnectBackoffBase = Duration(seconds: 3);
+  static const _reconnectBackoffMax = Duration(seconds: 30);
+  static const _rssiKeepAliveInterval = Duration(seconds: 3);
 
   final _audioStreamController = StreamController<Uint8List>.broadcast();
   final _storageStreamController = StreamController<List<int>>.broadcast();
@@ -86,6 +90,9 @@ class OmiDeviceService extends ChangeNotifier {
   bool _autoReconnect = true;
   int _reconnectAttempts = 0;
   Timer? _reconnectTimer;
+  Timer? _rssiTimer;
+  BluetoothConnectionState? _lastDeviceState;
+  bool _connecting = false;
   bool _disposed = false;
 
   Future<bool> _requestPermissions() async {
@@ -175,16 +182,27 @@ class OmiDeviceService extends ChangeNotifier {
   }
 
   Future<void> connect(String deviceId) async {
+    if (_connecting) return;
+    _connecting = true;
+    // A stale reconnect timer must not fire into a fresh attempt.
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     connectionState.value = OmiConnectionState.connecting;
     notifyListeners();
 
     final device = BluetoothDevice.fromId(deviceId);
     _device = device;
-    _autoReconnect = true;
 
     await _connSub?.cancel();
+    _lastDeviceState = null;
     _connSub = device.connectionState.listen((state) {
-      if (state == BluetoothConnectionState.disconnected) {
+      // flutter_blue_plus replays the current state on subscribe, so
+      // only a real connected → disconnected transition counts as a
+      // disconnection (mirrors the official app's de-dup guard).
+      final prev = _lastDeviceState;
+      _lastDeviceState = state;
+      if (state == BluetoothConnectionState.disconnected &&
+          prev == BluetoothConnectionState.connected) {
         _handleDisconnection();
       }
     });
@@ -203,12 +221,34 @@ class OmiDeviceService extends ChangeNotifier {
       await _discoverAndSubscribe(device);
       connectionState.value = OmiConnectionState.connected;
       _reconnectAttempts = 0;
+      _startRssiKeepAlive(device);
       notifyListeners();
     } catch (e) {
       connectionState.value = OmiConnectionState.disconnected;
       notifyListeners();
       rethrow;
+    } finally {
+      _connecting = false;
     }
+  }
+
+  /// Periodic RSSI reads keep the link busy and prevent supervision
+  /// timeout disconnects — the same keep-alive the official omi app
+  /// runs natively every 3 seconds.
+  void _startRssiKeepAlive(BluetoothDevice device) {
+    _rssiTimer?.cancel();
+    _rssiTimer = Timer.periodic(_rssiKeepAliveInterval, (_) async {
+      try {
+        await device.readRssi();
+      } catch (_) {
+        // Fails while disconnected; the reconnect flow handles that.
+      }
+    });
+  }
+
+  void _stopRssiKeepAlive() {
+    _rssiTimer?.cancel();
+    _rssiTimer = null;
   }
 
   Future<void> _discoverAndSubscribe(BluetoothDevice device) async {
@@ -220,14 +260,16 @@ class OmiDeviceService extends ChangeNotifier {
       if (service.uuid == _audioServiceGuid) {
         for (final ch in service.characteristics) {
           if (ch.uuid == _audioDataCharGuid) {
-            _audioDataChar = ch;
-            await ch.setNotifyValue(true);
+            // onValueReceived (not lastValueStream): no stale-value
+            // replay on re-subscribe and no echoes of our own writes.
+            // Subscribe before enabling notify so no packet is missed.
             await _audioSub?.cancel();
-            _audioSub = ch.lastValueStream.listen((value) {
+            _audioSub = ch.onValueReceived.listen((value) {
               if (value.isNotEmpty) {
                 _audioStreamController.add(Uint8List.fromList(value));
               }
             });
+            await ch.setNotifyValue(true);
           } else if (ch.uuid == _codecTypeCharGuid) {
             final value = await ch.read();
             if (value.isNotEmpty) {
@@ -246,13 +288,13 @@ class OmiDeviceService extends ChangeNotifier {
             } catch (_) {
               // read may fail before notifications are enabled; ignore.
             }
-            await ch.setNotifyValue(true);
             await _batterySub?.cancel();
-            _batterySub = ch.lastValueStream.listen((value) {
+            _batterySub = ch.onValueReceived.listen((value) {
               if (value.isNotEmpty) {
                 batteryLevel.value = value.first;
               }
             });
+            await ch.setNotifyValue(true);
           }
         }
       } else if (service.uuid == _deviceInfoServiceGuid) {
@@ -270,26 +312,26 @@ class OmiDeviceService extends ChangeNotifier {
         for (final ch in service.characteristics) {
           if (ch.uuid == _storageDataCharGuid) {
             _storageDataChar = ch;
-            await ch.setNotifyValue(true);
             await _storageSub?.cancel();
-            _storageSub = ch.lastValueStream.listen((value) {
+            _storageSub = ch.onValueReceived.listen((value) {
               if (value.isNotEmpty) {
                 debugPrint('[BLE] storage raw notify len=${value.length}');
                 _storageStreamController.add(value);
               }
             });
+            await ch.setNotifyValue(true);
           } else if (ch.uuid == _storageReadCtrlCharGuid) {
             _storageReadCtrlChar = ch;
           } else if (ch.uuid == _storageWifiCharGuid) {
             _wifiChar = ch;
-            await ch.setNotifyValue(true);
             await _wifiSub?.cancel();
-            _wifiSub = ch.lastValueStream.listen((value) {
+            _wifiSub = ch.onValueReceived.listen((value) {
               if (value.isNotEmpty) {
                 debugPrint('[BLE] wifi char notify len=${value.length}');
                 _wifiStreamController.add(value);
               }
             });
+            await ch.setNotifyValue(true);
             debugPrint('[BLE] WiFi characteristic discovered');
           }
         }
@@ -391,36 +433,6 @@ class OmiDeviceService extends ChangeNotifier {
     final ch = _storageDataChar;
     if (ch == null) return;
     await ch.write([0x03]);
-  }
-
-  BluetoothCharacteristic? _audioDataChar;
-
-  /// Pause audio notifications so the device can serve storage reads.
-  /// CV1 can't do both simultaneously (returns 0x06 if audio is active).
-  Future<void> pauseAudioNotifications() async {
-    if (_audioDataChar != null) {
-      await _audioSub?.cancel();
-      _audioSub = null;
-      try {
-        await _audioDataChar!.setNotifyValue(false);
-      } catch (_) {}
-      debugPrint('[BLE] Audio notifications paused');
-    }
-  }
-
-  /// Resume audio notifications after storage sync is done.
-  Future<void> resumeAudioNotifications() async {
-    if (_audioDataChar != null) {
-      try {
-        await _audioDataChar!.setNotifyValue(true);
-        _audioSub = _audioDataChar!.lastValueStream.listen((value) {
-          if (value.isNotEmpty) {
-            _audioStreamController.add(Uint8List.fromList(value));
-          }
-        });
-      } catch (_) {}
-      debugPrint('[BLE] Audio notifications resumed');
-    }
   }
 
   /// Send CMD_READ_FILE (0x11) — new multi-file protocol.
@@ -582,19 +594,32 @@ class OmiDeviceService extends ChangeNotifier {
 
   void _handleDisconnection() {
     if (_disposed) return;
+    _stopRssiKeepAlive();
     if (connectionState.value == OmiConnectionState.disconnected) return;
     connectionState.value = OmiConnectionState.disconnected;
     notifyListeners();
-    if (_autoReconnect &&
-        _device != null &&
-        _reconnectAttempts < _maxReconnectAttempts) {
+    if (_autoReconnect && _device != null) {
       _scheduleReconnect();
     }
   }
 
+  Duration _nextReconnectDelay() {
+    final shift = _reconnectAttempts.clamp(0, 4);
+    final seconds = (_reconnectBackoffBase.inSeconds << shift).clamp(
+      _reconnectBackoffBase.inSeconds,
+      _reconnectBackoffMax.inSeconds,
+    );
+    return Duration(seconds: seconds);
+  }
+
   void _scheduleReconnect() {
     _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(_reconnectDelay, () async {
+    final delay = _nextReconnectDelay();
+    debugPrint(
+      '[BLE] reconnect attempt ${_reconnectAttempts + 1} '
+      'in ${delay.inSeconds}s',
+    );
+    _reconnectTimer = Timer(delay, () async {
       if (_disposed || _device == null || !_autoReconnect) return;
       _reconnectAttempts++;
       connectionState.value = OmiConnectionState.reconnecting;
@@ -602,7 +627,7 @@ class OmiDeviceService extends ChangeNotifier {
       try {
         await connect(_device!.remoteId.str);
       } catch (_) {
-        if (_autoReconnect && _reconnectAttempts < _maxReconnectAttempts) {
+        if (_autoReconnect) {
           _scheduleReconnect();
         }
       }
@@ -613,6 +638,8 @@ class OmiDeviceService extends ChangeNotifier {
     _autoReconnect = false;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
+    _stopRssiKeepAlive();
+    _lastDeviceState = null;
     await _audioSub?.cancel();
     _audioSub = null;
     await _storageSub?.cancel();
@@ -651,6 +678,7 @@ class OmiDeviceService extends ChangeNotifier {
     _disposed = true;
     _autoReconnect = false;
     _reconnectTimer?.cancel();
+    _rssiTimer?.cancel();
     _audioSub?.cancel();
     _storageSub?.cancel();
     _wifiSub?.cancel();

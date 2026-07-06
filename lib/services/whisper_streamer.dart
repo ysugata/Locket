@@ -358,7 +358,9 @@ class WhisperStreamer extends ChangeNotifier {
           if (gap < 1000) {
             _gapCount++;
             _totalGapFrames += gap;
-            _log('GAP: expected=$expected got=$packetId missing=$gap frames (total gaps=$_gapCount, total missing=$_totalGapFrames)');
+            _log(
+              'GAP: expected=$expected got=$packetId missing=$gap frames (total gaps=$_gapCount, total missing=$_totalGapFrames)',
+            );
           }
         }
       }
