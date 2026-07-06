@@ -10,6 +10,7 @@ import 'services/ios_audio_session.dart';
 import 'services/omi_device_service.dart';
 import 'services/sdcard_sync_service.dart';
 import 'services/settings_service.dart';
+import 'services/wal_store.dart';
 import 'services/whisper_streamer.dart';
 import 'services/wifi_sync_service.dart';
 
@@ -24,6 +25,7 @@ class AppController extends ChangeNotifier {
   final BackgroundService background;
 
   WhisperStreamer? _streamer;
+  WalStore? _walStore;
   SDCardSyncService? _sdCardSync;
   WifiSyncService? _wifiSync;
   FirmwareService? _firmwareService;
@@ -140,11 +142,23 @@ class AppController extends ChangeNotifier {
             '文字起こしが正しく動作しない可能性があります';
       }
 
+      // Disk-backed WAL: offline audio is spilled here and recovered
+      // via POST /sdcard/upload. Survives app kills and crashes.
+      final walStore = WalStore(
+        uploadUrl: _buildUploadUrl(),
+        authToken: settings.authToken,
+        deviceId: settings.deviceId,
+      );
+      await walStore.init();
+      _walStore?.dispose();
+      _walStore = walStore;
+
       final streamer = WhisperStreamer(
         baseUrl: settings.baseUrl,
         authToken: settings.authToken,
         deviceId: settings.deviceId,
         language: settings.language,
+        walStore: walStore,
       );
       // Forward streamer state changes so the HomePage AnimatedBuilder
       // (which only watches `this`) rebuilds when WS state or errors
@@ -196,6 +210,9 @@ class AppController extends ChangeNotifier {
 
       _running = true;
       notifyListeners();
+
+      // Recover WAL segments left over from a previous run or crash.
+      walStore.uploadPending();
 
       // Auto-sync SD card in the background after connection is ready.
       _autoSyncSDCard();
@@ -300,6 +317,10 @@ class AppController extends ChangeNotifier {
     await _streamer?.disconnect();
     _streamer?.dispose();
     _streamer = null;
+    // Segment files stay on disk; only the handle is released. They
+    // are recovered by uploadPending() on the next start.
+    _walStore?.dispose();
+    _walStore = null;
     await device.disconnect();
     await background.stop();
     await IOSAudioSession.deactivate();
