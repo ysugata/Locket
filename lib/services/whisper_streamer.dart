@@ -8,6 +8,8 @@ import 'package:web_socket_channel/status.dart' as ws_status;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../models/transcript_segment.dart';
+import 'sdcard_protocol.dart' show encodeLengthPrefixedFrames;
+import 'wal_store.dart';
 
 /// Builds the WebSocket URL in the exact shape BasedHardware/omi's Flutter
 /// client builds, plus the `&token=` query the user's custom bridge
@@ -81,13 +83,21 @@ class WhisperStreamer extends ChangeNotifier {
 
   /// In-memory offline buffer cap (~12 minutes of 16 kHz mono OPUS at
   /// ~80 bytes / 10 ms). Old packets are dropped oldest-first when the
-  /// buffer is full.
+  /// buffer is full. Only reached when disk spilling is unavailable.
   static const int _walMaxBytes = 10 * 1024 * 1024;
+
+  /// Once the offline buffer holds this much (~15 s of audio), it is
+  /// spilled to [walStore] as an upload-ready segment so an app kill
+  /// or crash can no longer lose it.
+  static const int _walSpillThresholdBytes = 128 * 1024;
 
   final String baseUrl;
   final String authToken;
   final String deviceId;
   final String language;
+
+  /// Disk store for offline audio; null disables spilling (tests).
+  final WalStore? walStore;
 
   WebSocketChannel? _channel;
   StreamSubscription<dynamic>? _channelSub;
@@ -129,6 +139,11 @@ class WhisperStreamer extends ChangeNotifier {
   final Queue<Uint8List> _walBuffer = Queue<Uint8List>();
   int _walBufferBytes = 0;
 
+  /// Wall-clock arrival time of the oldest frame in [_walBuffer];
+  /// becomes the spilled segment's X-Timestamp-Start.
+  int? _walBufferStartedAtMs;
+  bool _spillDisabled = false;
+
   Uri? _lastUri;
   Uri? get lastUri => _lastUri;
 
@@ -137,6 +152,7 @@ class WhisperStreamer extends ChangeNotifier {
     required this.authToken,
     required this.deviceId,
     this.language = 'ja',
+    this.walStore,
   });
 
   Uri _buildUri() => buildWhisperUri(
@@ -383,12 +399,59 @@ class WhisperStreamer extends ChangeNotifier {
   }
 
   void _appendToWal(Uint8List bytes) {
+    _walBufferStartedAtMs ??= DateTime.now().millisecondsSinceEpoch;
     _walBuffer.add(bytes);
     _walBufferBytes += bytes.length;
+
+    final store = walStore;
+    if (store != null &&
+        !_spillDisabled &&
+        _walBufferBytes >= _walSpillThresholdBytes) {
+      _spillToDisk(store);
+    }
+
     while (_walBufferBytes > _walMaxBytes && _walBuffer.isNotEmpty) {
       final dropped = _walBuffer.removeFirst();
       _walBufferBytes -= dropped.length;
     }
+  }
+
+  /// Move the whole in-memory buffer into one upload-ready disk
+  /// segment. The WS flush path then only ever replays what is still
+  /// in memory, so live-stream and HTTP-recovered audio never overlap.
+  void _spillToDisk(WalStore store) {
+    final frames = List<Uint8List>.of(_walBuffer);
+    _walBuffer.clear();
+    final drainedBytes = _walBufferBytes;
+    _walBufferBytes = 0;
+    final startedAtMs =
+        _walBufferStartedAtMs ?? DateTime.now().millisecondsSinceEpoch;
+    _walBufferStartedAtMs = null;
+
+    // /sdcard/upload expects headerless frames (X-Frame-Header: none).
+    final headerless = <Uint8List>[
+      for (final f in frames)
+        if (f.length > omiBleHeaderSize)
+          Uint8List.sublistView(f, omiBleHeaderSize),
+    ];
+    final body = encodeLengthPrefixedFrames(headerless);
+
+    store.writeSegment(body, startedAtMs ~/ 1000).then((ok) {
+      if (_disposed) return;
+      if (ok) {
+        _log('WAL: spilled ${frames.length} frames (${drainedBytes}B) to disk');
+        return;
+      }
+      // Disk unavailable — put the frames back (oldest first) and stay
+      // memory-only for the rest of this streamer's life.
+      _spillDisabled = true;
+      for (var i = frames.length - 1; i >= 0; i--) {
+        _walBuffer.addFirst(frames[i]);
+      }
+      _walBufferBytes += drainedBytes;
+      _walBufferStartedAtMs = startedAtMs;
+      _log('WAL: disk spill failed — memory buffer only');
+    });
   }
 
   void _flushWalBuffer() {
@@ -409,6 +472,9 @@ class WhisperStreamer extends ChangeNotifier {
         return;
       }
     }
+    _walBufferStartedAtMs = null;
+    // Recover any disk segments now that connectivity is back.
+    walStore?.uploadPending();
   }
 
   int get walBufferedBytes => _walBufferBytes;

@@ -18,10 +18,18 @@ Omi CV1 BLE ウェアラブルから音声を取得し、自前の Whisper サ�
   - 接続中は 3 秒ごとの RSSI 読み取りで supervision timeout 切断を予防
   - デバイスのコーデックが OPUS 以外の場合は警告を表示
 - **ライブ中継**: BLE Notify で受けた音声バイト列（3 バイト Omi ヘッダ付き）を
-  そのまま WebSocket でブリッジに送信。切断中はメモリ上の WAL バッファ
-  (最大 10MB) に退避し、再接続時にフラッシュ
+  そのまま WebSocket でブリッジに送信
   - クライアント側の VAD・フレーム間引きは行わない（全フレーム送信、
     無音処理はサーバー責務）。パケット ID ギャップの検知・統計のみ実施
+- **オフライン WAL（二段構え）**: WS 切断中の音声はまずメモリに退避し、
+  再接続時に WS でフラッシュ。約 15 秒分を超えた分は**ディスクに永続化**し、
+  接続回復時・次回起動時に `POST /sdcard/upload` で回収
+  - セグメントは `Documents/wal/wal_<開始epoch>_<連番>.bin`
+    （`[len:4 LE][frame]...`、アップロード成功後に削除）
+  - `X-Timestamp-Start` に録音開始時刻を設定するため、後から回収しても
+    文字起こしの時刻は録音時刻になる
+  - 合計 500MB 上限（超過時は最古から削除）。アプリの kill・クラッシュでも
+    音声が消えない
 - **SD カード同期**: CV1 の SD に溜まった録音を BLE 経由で吸い上げ、
   `POST /sdcard/upload` に一括アップロード。接続確立時に自動実行
   - マルチファイル (CMD_LIST 0x10 / CMD_READ 0x11 / CMD_DELETE 0x12) と
@@ -83,6 +91,7 @@ flutter run --release   # iOS 実機 (BLE はシミュレータ不可)
 |---|---|
 | `lib/services/omi_device_service.dart` | BLE スキャン・接続・特性購読 |
 | `lib/services/whisper_streamer.dart` | WS 中継 + WAL バッファ |
+| `lib/services/wal_store.dart` | オフライン音声のディスク永続化と HTTP 回収 |
 | `lib/services/sdcard_sync_service.dart` | SD カード同期 |
 | `lib/services/sdcard_protocol.dart` | ストレージ通知のパーサー（純関数） |
 | `lib/services/wifi_sync_service.dart` | WiFi (SoftAP + TCP) 同期 |
