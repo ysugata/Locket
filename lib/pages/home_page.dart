@@ -321,7 +321,13 @@ class _InfoRow extends StatelessWidget {
           child: _InfoTile(
             icon: Icons.music_note,
             label: 'コーデック',
-            value: codec >= 0 ? (codec == 20 ? 'OPUS' : 'id=$codec') : '-',
+            value: codec >= 0
+                ? (codec == omiCodecOpus
+                      ? 'OPUS'
+                      : (codec == omiCodecOpusFS320
+                            ? 'OPUS FS320'
+                            : 'id=$codec'))
+                : '-',
           ),
         ),
         const SizedBox(width: 8),

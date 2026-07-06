@@ -135,9 +135,11 @@ class AppController extends ChangeNotifier {
       await device.connect(bleId);
 
       // The relay assumes OPUS; anything else would be transcribed as
-      // garbage server-side, so surface it prominently.
+      // garbage server-side, so surface it prominently. Both OPUS ids
+      // (20 and FS320's 21) are fine — the frames self-describe their
+      // size to the decoder.
       final codec = device.codecId.value;
-      if (codec >= 0 && codec != omiCodecOpus) {
+      if (codec >= 0 && !isOpusCodec(codec)) {
         _lastError =
             'デバイスのコーデックがOPUSではありません (id=$codec)。'
             '文字起こしが正しく動作しない可能性があります';
