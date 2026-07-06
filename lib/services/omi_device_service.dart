@@ -27,8 +27,16 @@ final _batteryLevelCharGuid = Guid('00002a19-0000-1000-8000-00805f9b34fb');
 final _deviceInfoServiceGuid = Guid('0000180a-0000-1000-8000-00805f9b34fb');
 final _firmwareRevisionCharGuid = Guid('00002a26-0000-1000-8000-00805f9b34fb');
 
-/// OPUS codec identifier per Omi spec.
+/// OPUS codec identifiers per Omi spec (omi_connection.dart:145-152):
+/// 20 = OPUS (160-sample frames), 21 = OPUS FS320 (320-sample frames).
+/// Both are plain OPUS on the wire — the official client's
+/// `isOpusSupported()` accepts either.
 const int omiCodecOpus = 20;
+const int omiCodecOpusFS320 = 21;
+
+/// True when [codecId] is an OPUS-family codec the bridge can decode.
+bool isOpusCodec(int codecId) =>
+    codecId == omiCodecOpus || codecId == omiCodecOpusFS320;
 
 enum OmiConnectionState {
   disconnected,
