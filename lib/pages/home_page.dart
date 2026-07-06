@@ -112,6 +112,14 @@ class _StatusCard extends StatelessWidget {
     final sent = streamer?.bytesSent.value ?? 0;
     final received = streamer?.messagesReceived.value ?? 0;
     final uri = streamer?.lastUri;
+    final walMemoryBytes = streamer?.walBufferedBytes ?? 0;
+    final walStore = app.walStore;
+    final walDiskBytes = walStore?.pendingBytes.value ?? 0;
+    final walDiskSegments = walStore?.pendingSegments.value ?? 0;
+    final sdSync = app.sdCardSync;
+    final sdError = (sdSync?.isSyncing.value ?? false)
+        ? null
+        : sdSync?.lastError.value;
 
     return Card(
       child: Padding(
@@ -160,6 +168,24 @@ class _StatusCard extends StatelessWidget {
                     fontSize: 11,
                   ),
                 ),
+              if (walMemoryBytes > 0 || walDiskSegments > 0)
+                Text(
+                  '未送信バッファ: メモリ ${_formatBytes(walMemoryBytes)}'
+                  '${walDiskSegments > 0 ? ' / ディスク ${_formatBytes(walDiskBytes)} ($walDiskSegmentsセグメント)' : ''}',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+            ],
+            if (sdError != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                'SD同期: $sdError',
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 12,
+                ),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
             ],
             if (displayError != null) ...[
               const SizedBox(height: 8),
