@@ -306,23 +306,6 @@ class WhisperStreamer extends ChangeNotifier {
     }
   }
 
-  /// Adaptive VAD: compares each frame's OPUS payload size against
-  /// a rolling average. CV1 doesn't use OPUS DTX, so silence frames
-  /// are still 60-70 bytes (vs 80-150 for speech). Frames below
-  /// `rollingAvg * _vadRatio` for `_vadHoldFrames` consecutive frames
-  /// are considered silence and skipped.
-  static const double _vadRatio = 0.78;
-  static const int _vadHoldFrames = 50; // ~1 second at 50fps
-  static const int _vadWindowSize = 500; // ~10 seconds
-
-  final List<int> _vadWindow = [];
-  int _vadWindowSum = 0;
-  int _silentFrameCount = 0;
-  int _vadSkippedCount = 0;
-
-  /// Number of frames skipped by VAD since the streamer was created.
-  int get vadSkippedCount => _vadSkippedCount;
-
   // Packet gap detection using the Omi 3-byte header:
   // [packet_id_low, packet_id_high, fragment_index]
   int _lastPacketId = -1;
@@ -339,9 +322,10 @@ class WhisperStreamer extends ChangeNotifier {
   /// `frame_header=3byte` and strips the 3-byte Omi packet header
   /// server-side, so Locket must NOT strip it on the client.
   ///
-  /// VAD: skips frames whose OPUS payload is below _vadThresholdBytes,
-  /// but only after _vadHoldFrames consecutive silent frames (to
-  /// avoid clipping speech onsets).
+  /// Every frame is forwarded; there is deliberately no client-side
+  /// VAD or filtering (the official omi client sends everything too).
+  /// Silence handling is the server's job — a size-heuristic VAD here
+  /// risks permanently dropping quiet speech.
   void streamAudio(Stream<Uint8List> audioStream) {
     _audioSub?.cancel();
     _audioSub = audioStream.listen((bytes) {
@@ -365,36 +349,6 @@ class WhisperStreamer extends ChangeNotifier {
         }
       }
       _lastPacketId = packetId;
-
-      final payloadSize = bytes.length - omiBleHeaderSize;
-
-      // Update rolling window for adaptive threshold.
-      _vadWindow.add(payloadSize);
-      _vadWindowSum += payloadSize;
-      if (_vadWindow.length > _vadWindowSize) {
-        _vadWindowSum -= _vadWindow.removeAt(0);
-      }
-
-      // Need enough samples before VAD kicks in.
-      if (_vadWindow.length >= 100) {
-        final avg = _vadWindowSum / _vadWindow.length;
-        final threshold = (avg * _vadRatio).toInt();
-
-        if (payloadSize < threshold) {
-          _silentFrameCount++;
-          if (_silentFrameCount >= _vadHoldFrames) {
-            _vadSkippedCount++;
-            if (_vadSkippedCount % 500 == 0) {
-              _log(
-                'VAD: skipped=$_vadSkippedCount avg=${avg.toInt()} thresh=$threshold cur=$payloadSize',
-              );
-            }
-            return; // suppress
-          }
-        } else {
-          _silentFrameCount = 0;
-        }
-      }
 
       _sendOrBuffer(bytes);
     });
