@@ -116,7 +116,7 @@ class SDCardSyncService extends ChangeNotifier {
       // byte offset, use legacy).
       if (field1 < 1000) {
         debugPrint('[SDSync] multi-file: $field1 files, $totalBytesOnCard B');
-        await _syncMultiFile();
+        await _syncMultiFile(field1);
       } else {
         debugPrint('[SDSync] legacy: offset=$field1');
         await _syncLegacy(field1);
@@ -140,7 +140,9 @@ class SDCardSyncService extends ChangeNotifier {
 
   /// New multi-file protocol: list files, read + upload each non-empty
   /// file, then delete fully-synced files in descending index order.
-  Future<void> _syncMultiFile() async {
+  /// [fileCountFromStats] (from the read-control characteristic) is the
+  /// fallback file count when CMD_LIST gets no usable response.
+  Future<void> _syncMultiFile(int fileCountFromStats) async {
     // The firmware sometimes stays silent on CMD_LIST right after a
     // STOP or an interrupted transfer — the official client retries
     // up to 3 times with a 700ms pause ("PR #5905 pattern").
@@ -163,6 +165,24 @@ class SDCardSyncService extends ChangeNotifier {
       );
     }
 
+    // Fallback when CMD_LIST stays unanswered: the storage stats
+    // already told us how many files exist, and CMD_READ_FILE only
+    // needs the index — so scan indices directly. Sizes are unknown
+    // (0), which makes completion END-marker-based and progress
+    // bytes-based; both paths handle that.
+    var listUnavailable = false;
+    if (files.isEmpty && fileCountFromStats > 0) {
+      listUnavailable = true;
+      debugPrint(
+        '[SDSync] CMD_LIST unanswered — falling back to index scan '
+        'of $fileCountFromStats files',
+      );
+      files = [
+        for (var i = 0; i < fileCountFromStats; i++)
+          {'index': i, 'timestamp': 0, 'size': 0},
+      ];
+    }
+
     if (files.isEmpty) {
       // Never end silently — the storage stats said there is data.
       lastError.value = 'SDファイル一覧の取得に失敗しました（3回試行してタイムアウト）';
@@ -170,14 +190,22 @@ class SDCardSyncService extends ChangeNotifier {
       return;
     }
 
-    // Filter to non-empty files only and recalculate total.
-    final nonEmpty = files.where((f) => (f['size'] ?? 0) > 0).toList();
-    int actualTotal = 0;
-    for (final f in nonEmpty) {
-      actualTotal += f['size'] ?? 0;
+    // Filter to non-empty files only and recalculate total. In
+    // fallback mode sizes are unknown, so keep every index and the
+    // stats-reported total.
+    final nonEmpty = listUnavailable
+        ? files
+        : files.where((f) => (f['size'] ?? 0) > 0).toList();
+    if (!listUnavailable) {
+      int actualTotal = 0;
+      for (final f in nonEmpty) {
+        actualTotal += f['size'] ?? 0;
+      }
+      totalBytesOnCard = actualTotal;
     }
-    totalBytesOnCard = actualTotal;
-    debugPrint('[SDSync] ${nonEmpty.length} non-empty files, $actualTotal B');
+    debugPrint(
+      '[SDSync] ${nonEmpty.length} files to read, $totalBytesOnCard B',
+    );
     if (nonEmpty.isEmpty) return;
 
     // Indices of files that are safe to delete (fully received and
@@ -197,10 +225,18 @@ class SDCardSyncService extends ChangeNotifier {
         idx,
         expectedSize: size,
         onProgress: (fraction) {
-          progress.value = ((filesProcessed + fraction) / totalFiles).clamp(
-            0.0,
-            0.99,
-          );
+          if (fraction < 0) {
+            // Sizes unknown — overall bytes-based progress instead.
+            if (totalBytesOnCard > 0) {
+              progress.value = (transferredBytes.value / totalBytesOnCard)
+                  .clamp(0.0, 0.99);
+            }
+          } else {
+            progress.value = ((filesProcessed + fraction) / totalFiles).clamp(
+              0.0,
+              0.99,
+            );
+          }
           notifyListeners();
         },
       );
@@ -424,6 +460,9 @@ class SDCardSyncService extends ChangeNotifier {
           onProgress?.call(
             ((startOffset + audioBytes) / expectedSize).clamp(0.0, 1.0),
           );
+        } else {
+          // Size unknown (list fallback) — signal "bytes only".
+          onProgress?.call(-1);
         }
       },
       onError: (Object e) {
