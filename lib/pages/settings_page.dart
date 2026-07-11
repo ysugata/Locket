@@ -523,11 +523,50 @@ class _SDCardSection extends StatelessWidget {
                     ],
                   ],
                 ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: sync == null || syncing
+                      ? null
+                      : () => _confirmRescue(context),
+                  icon: const Icon(Icons.medical_services_outlined),
+                  label: const Text('レスキュー同期（SDが応答しない時）'),
+                ),
               ],
             ),
           ),
         ),
       ],
     );
+  }
+
+  Future<void> _confirmRescue(BuildContext context) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('レスキュー同期'),
+        content: const Text(
+          'SDカードが満杯で応答しない場合の復旧モードです。\n\n'
+          '・実行中はリアルタイム文字起こしが一時停止します\n'
+          '・読み出せないファイルを最大5件（最古のもの、合計約25MB＝'
+          '90分程度の録音）を削除して空き容量を作ります。'
+          'この削除は元に戻せません\n'
+          '・空きができ次第、残りの録音をすべて吸い上げます\n\n'
+          '数時間かかることがあります。就寝中などの実行がおすすめです。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('実行する'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      app.rescueSDCard();
+    }
   }
 }

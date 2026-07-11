@@ -316,6 +316,15 @@ class AppController extends ChangeNotifier {
     await sync.syncAll();
   }
 
+  /// Rescue sync for a wedged/full card: pauses live transcription,
+  /// sacrifices up to 5 unreadable files to free LittleFS headroom,
+  /// then drains everything readable.
+  Future<void> rescueSDCard() async {
+    final sync = _sdCardSync;
+    if (sync == null) return;
+    await sync.rescueSync();
+  }
+
   /// Manually trigger WiFi sync.
   Future<void> syncWifi() async {
     final sync = _wifiSync;

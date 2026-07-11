@@ -94,6 +94,7 @@ class OmiDeviceService extends ChangeNotifier {
   BluetoothCharacteristic? _storageDataChar;
   BluetoothCharacteristic? _storageReadCtrlChar;
   BluetoothCharacteristic? _wifiChar;
+  BluetoothCharacteristic? _audioDataChar;
 
   bool _autoReconnect = true;
   int _reconnectAttempts = 0;
@@ -268,6 +269,7 @@ class OmiDeviceService extends ChangeNotifier {
       if (service.uuid == _audioServiceGuid) {
         for (final ch in service.characteristics) {
           if (ch.uuid == _audioDataCharGuid) {
+            _audioDataChar = ch;
             // onValueReceived (not lastValueStream): no stale-value
             // replay on re-subscribe and no echoes of our own writes.
             // Subscribe before enabling notify so no packet is missed.
@@ -485,8 +487,14 @@ class OmiDeviceService extends ChangeNotifier {
   }
 
   /// Send CMD_DELETE_FILE (0x12, fileIndex) — new multi-file protocol.
-  /// Waits for a single-byte response (0x00 = success) with 5s timeout.
-  Future<bool> deleteStorageFile(int fileIndex) async {
+  /// Waits for a single-byte response (0x00 = success). On a wedged,
+  /// nearly-full LittleFS a delete can take a very long time (metadata
+  /// rewrite triggers full-filesystem scans), so [timeout] is
+  /// configurable — the rescue path uses 60s.
+  Future<bool> deleteStorageFile(
+    int fileIndex, {
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
     final ch = _storageDataChar;
     if (ch == null) {
       throw StateError('Storage data characteristic not available');
@@ -494,17 +502,17 @@ class OmiDeviceService extends ChangeNotifier {
 
     final completer = Completer<bool>();
     StreamSubscription<List<int>>? sub;
-    Timer? timeout;
+    Timer? timeoutTimer;
 
     sub = storageStream.listen((value) {
       if (value.length == 1) {
         sub?.cancel();
-        timeout?.cancel();
-        completer.complete(value[0] == 0x00);
+        timeoutTimer?.cancel();
+        if (!completer.isCompleted) completer.complete(value[0] == 0x00);
       }
     });
 
-    timeout = Timer(const Duration(seconds: 5), () {
+    timeoutTimer = Timer(timeout, () {
       sub?.cancel();
       if (!completer.isCompleted) {
         debugPrint('[BLE] CMD_DELETE_FILE timeout for index $fileIndex');
@@ -514,6 +522,43 @@ class OmiDeviceService extends ChangeNotifier {
 
     await ch.write([0x12, fileIndex & 0xFF], withoutResponse: false);
     return completer.future;
+  }
+
+  /// Pause the audio notification subscription (CCC unsubscribe). The
+  /// firmware's audio pusher floods the BLE TX buffer pool only while
+  /// the CCC is subscribed (transport.c:1108-1114) — pausing frees the
+  /// radio and the SD worker for storage transfers (rescue sync).
+  /// Note: fw 3.0.17 discards mic audio while connected regardless of
+  /// subscription state, so pausing loses only live transcription.
+  Future<void> pauseAudioNotifications() async {
+    final ch = _audioDataChar;
+    if (ch == null) return;
+    await _audioSub?.cancel();
+    _audioSub = null;
+    try {
+      await ch.setNotifyValue(false);
+      debugPrint('[BLE] audio notifications paused');
+    } catch (e) {
+      debugPrint('[BLE] audio pause failed: $e');
+    }
+  }
+
+  /// Re-enable audio notifications after a rescue sync.
+  Future<void> resumeAudioNotifications() async {
+    final ch = _audioDataChar;
+    if (ch == null) return;
+    await _audioSub?.cancel();
+    _audioSub = ch.onValueReceived.listen((value) {
+      if (value.isNotEmpty) {
+        _audioStreamController.add(Uint8List.fromList(value));
+      }
+    });
+    try {
+      await ch.setNotifyValue(true);
+      debugPrint('[BLE] audio notifications resumed');
+    } catch (e) {
+      debugPrint('[BLE] audio resume failed: $e');
+    }
   }
 
   /// Whether the WiFi control characteristic (30295783) was discovered.
