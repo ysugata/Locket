@@ -198,6 +198,7 @@ class AppController extends ChangeNotifier {
         uploadUrl: _buildUploadUrl(),
         authToken: settings.authToken,
         deviceId: settings.deviceId,
+        walStore: walStore,
       );
       _sdCardSync!.addListener(notifyListeners);
 

@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 
 import 'omi_device_service.dart';
 import 'sdcard_protocol.dart';
+import 'wal_store.dart';
 
 /// Syncs OPUS audio stored on the Omi CV1's SD card to the server.
 ///
@@ -13,18 +14,22 @@ import 'sdcard_protocol.dart';
 /// it's the new multi-file protocol (field[1] = fileCount); if >= 1000,
 /// it's the legacy protocol (field[1] = byte offset).
 ///
-/// Reliability rules (mirroring BasedHardware/omi's client):
-/// - A read times out only when the device sends nothing for the first
-///   5 seconds, plus a 10-minute overall cap — never mid-transfer.
-/// - A file is deleted from the device only after it was received
-///   completely (END marker + all bytes) AND uploaded successfully.
-/// - Deletes are deferred until all reads finish and run in descending
-///   index order, because the firmware re-indexes files after a delete.
+/// Reliability rules (matched to fw 3.0.17 behavior, see
+/// _syncMultiFile for the firmware-verified details):
+/// - Reads time out on stream inactivity only, never mid-transfer,
+///   and resume from the received byte offset after a stall.
+/// - The firmware auto-deletes fully-streamed files itself; the client
+///   never sends CMD_DELETE, and any audio whose upload failed is
+///   persisted to the disk WAL because the device no longer has it.
 class SDCardSyncService extends ChangeNotifier {
   final OmiDeviceService device;
   final String uploadUrl;
   final String authToken;
   final String deviceId;
+
+  /// Safety net for firmware auto-delete: frames whose upload failed
+  /// are persisted here (the device no longer has them).
+  final WalStore? walStore;
 
   static const Duration _firstDataTimeout = Duration(seconds: 5);
 
@@ -82,6 +87,7 @@ class SDCardSyncService extends ChangeNotifier {
     required this.uploadUrl,
     required this.authToken,
     required this.deviceId,
+    this.walStore,
   });
 
   Completer<void>? _activeCompleter;
@@ -156,97 +162,55 @@ class SDCardSyncService extends ChangeNotifier {
     }
   }
 
-  /// New multi-file protocol: list files, read + upload each non-empty
-  /// file, then delete fully-synced files in descending index order.
-  /// [fileCountFromStats] (from the read-control characteristic) is the
-  /// fallback file count when CMD_LIST gets no usable response.
+  /// New multi-file protocol, built around what fw 3.0.17 actually
+  /// does (verified against Omi_CV1_v3.0.17 firmware source):
+  ///
+  /// - CMD_LIST packs every entry into ONE notification, so it breaks
+  ///   beyond ~22 files (MTU) — never rely on it for iteration.
+  /// - The firmware AUTO-DELETES a file after streaming it to the END
+  ///   marker (except the currently-recording file) and re-indexes the
+  ///   remaining files. So: read index [base] repeatedly; when the
+  ///   stats file count drops, the next file slid into [base]; when it
+  ///   doesn't (empty entry / recording file), advance base.
+  /// - Client-side CMD_DELETE is never sent — after the firmware's
+  ///   auto-delete it would hit a re-indexed, unsynced file.
+  /// - Because the device deletes on its own, an upload failure must
+  ///   not lose audio: failed uploads are spilled to the disk WAL and
+  ///   recovered later via the same /sdcard/upload endpoint.
   Future<void> _syncMultiFile(int fileCountFromStats) async {
-    // The firmware sometimes stays silent on CMD_LIST right after a
-    // STOP or an interrupted transfer — the official client retries
-    // up to 3 times with a 700ms pause ("PR #5905 pattern").
-    var files = <Map<String, int>>[];
-    for (var attempt = 1; attempt <= 3 && files.isEmpty; attempt++) {
-      if (_cancelled) return;
-      if (attempt > 1) {
-        _log('CMD_LIST retry $attempt/3');
-        try {
-          await device.stopStorageSync();
-        } catch (_) {}
-        await Future<void>.delayed(const Duration(milliseconds: 700));
-      }
-      files = await device.listStorageFiles();
-    }
-    _log('listStorageFiles: ${files.length} files');
-    for (final f in files) {
-      _log('  index=${f['index']} ts=${f['timestamp']} size=${f['size']}');
-    }
-
-    // Fallback when CMD_LIST stays unanswered: the storage stats
-    // already told us how many files exist, and CMD_READ_FILE only
-    // needs the index — so scan indices directly. Sizes are unknown
-    // (0), which makes completion END-marker-based and progress
-    // bytes-based; both paths handle that.
-    var listUnavailable = false;
-    if (files.isEmpty && fileCountFromStats > 0) {
-      listUnavailable = true;
-      _log(
-        'CMD_LIST unanswered — falling back to index scan '
-        'of $fileCountFromStats files',
-      );
-      files = [
-        for (var i = 0; i < fileCountFromStats; i++)
-          {'index': i, 'timestamp': 0, 'size': 0},
-      ];
-    }
-
-    if (files.isEmpty) {
-      // Never end silently — the storage stats said there is data.
-      lastError.value = 'SDファイル一覧の取得に失敗しました（3回試行してタイムアウト）';
-      _log('No files returned by CMD_LIST_FILES');
+    if (fileCountFromStats <= 0) {
+      _log('stats report no files');
       return;
     }
 
-    // Filter to non-empty files only and recalculate total. In
-    // fallback mode sizes are unknown, so keep every index and the
-    // stats-reported total.
-    final nonEmpty = listUnavailable
-        ? files
-        : files.where((f) => (f['size'] ?? 0) > 0).toList();
-    if (!listUnavailable) {
-      int actualTotal = 0;
-      for (final f in nonEmpty) {
-        actualTotal += f['size'] ?? 0;
+    var base = 0;
+    var uploaded = 0;
+    var spilled = 0;
+    var skipped = 0;
+    var processed = 0;
+
+    while (processed < fileCountFromStats && !_cancelled) {
+      // Re-read stats each round: the firmware re-indexes after its
+      // auto-delete, and the count tells us whether [base] advanced.
+      final statsBefore = await device.getStorageList();
+      final countBefore = statsBefore.length > 1 ? statsBefore[1] : 0;
+      if (countBefore == 0) break;
+      // Never touch the newest file — it is (or may be) the file the
+      // firmware is currently recording into: it streams fine but is
+      // not auto-deleted, so it would be re-uploaded on every sync.
+      // It syncs on a later run once a newer file exists.
+      if (base >= countBefore - 1) {
+        _log('reached newest (possibly recording) file — stopping');
+        break;
       }
-      totalBytesOnCard = actualTotal;
-    }
-    _log('${nonEmpty.length} files to read, $totalBytesOnCard B');
-    if (nonEmpty.isEmpty) return;
 
-    // Indices of files that are safe to delete (fully received and
-    // uploaded, or reported empty by the device).
-    final deletable = <int>[];
-    var filesProcessed = 0;
-    final totalFiles = nonEmpty.length;
-    var aborted = false;
-
-    for (final file in nonEmpty) {
-      if (_cancelled) break;
-      final idx = file['index'] ?? 0;
-      final size = file['size'] ?? 0;
-      _log('Reading file $idx (${size}B)');
-
+      _log('Reading file[$base] (count=$countBefore)');
       final result = await _readFileWithResume(
-        idx,
-        expectedSize: size,
-        onProgress: (fraction) {
-          if (fraction < 0) {
-            // Sizes unknown — overall bytes-based progress instead.
-            if (totalBytesOnCard > 0) {
-              progress.value = (transferredBytes.value / totalBytesOnCard)
-                  .clamp(0.0, 0.99);
-            }
-          } else {
-            progress.value = ((filesProcessed + fraction) / totalFiles).clamp(
+        base,
+        expectedSize: 0,
+        onProgress: (_) {
+          if (totalBytesOnCard > 0) {
+            progress.value = (transferredBytes.value / totalBytesOnCard).clamp(
               0.0,
               0.99,
             );
@@ -255,85 +219,72 @@ class SDCardSyncService extends ChangeNotifier {
         },
       );
       if (_cancelled) break;
+      processed++;
 
-      if (result.deviceReportedEmpty && result.frames.isEmpty) {
-        // The device explicitly says the file is empty — nothing to
-        // lose, so mark it deletable to avoid re-listing it forever.
-        _log('File $idx: device reports empty, will delete');
-        deletable.add(idx);
-        filesProcessed++;
-        continue;
-      }
-
-      if (!result.complete) {
-        lastError.value =
-            'ファイル $idx の読み出しが完了しませんでした '
-            '(受信 ${result.audioBytes}B / 期待 ${size}B, '
-            'END ${result.endReceived ? "受信済" : "未受信"})。'
-            'ファイルは削除せず中断。詳細は虫アイコンのログ';
-        _log(
-          'File $idx incomplete '
-          '(end=${result.endReceived} ${result.audioBytes}/$size B) — '
-          'keeping on device, aborting sync',
-        );
-        aborted = true;
-        break;
-      }
-
-      if (result.frames.isEmpty) {
-        _log('File $idx: complete but 0 frames, skipping');
-        filesProcessed++;
-        continue;
-      }
-
-      final ok = await _uploadFrames(
-        result.frames,
-        timestampStart: _resolveTimestampStart(
-          file['timestamp'] ?? 0,
-          result.epochSeconds,
-        ),
-      );
-      if (!ok) {
-        aborted = true;
-        break;
-      }
-
-      deletable.add(idx);
-      filesProcessed++;
-      progress.value = (filesProcessed / totalFiles).clamp(0.0, 0.99);
-      notifyListeners();
-    }
-
-    // Delete only after all reads are done. The firmware re-indexes
-    // files after each delete, so deleting during the read loop would
-    // make the remaining indices point at the wrong files. Descending
-    // order keeps lower indices stable while we delete.
-    if (deletable.isNotEmpty) {
-      await device.stopStorageSync();
-      await Future<void>.delayed(const Duration(milliseconds: 300));
-      deletable.sort((a, b) => b.compareTo(a));
-      for (final idx in deletable) {
-        try {
-          final deleted = await device.deleteStorageFile(idx);
-          if (deleted) {
-            _log('Deleted file $idx');
+      if (result.frames.isNotEmpty) {
+        final ts = _resolveTimestampStart(0, result.epochSeconds);
+        final ok = await _uploadFrames(result.frames, timestampStart: ts);
+        if (ok) {
+          uploaded++;
+        } else if (walStore != null) {
+          // The firmware may already have auto-deleted this file — the
+          // phone now holds the only copy. Persist it for later upload.
+          final body = encodeLengthPrefixedFrames(result.frames);
+          final saved = await walStore!.writeSegment(body, ts);
+          if (saved) {
+            spilled++;
+            _log(
+              'upload failed — spilled ${result.frames.length} frames '
+              'to disk WAL for later recovery',
+            );
           } else {
-            _log('Delete file $idx: device returned failure');
+            lastError.value = 'アップロードとWAL退避の両方に失敗しました。中断します';
+            _log('upload AND wal spill failed — aborting');
+            break;
           }
-        } catch (e) {
-          _log('Delete file $idx failed: $e');
+        } else {
+          lastError.value = 'アップロードに失敗しました。中断します';
+          break;
         }
+      } else {
+        skipped++;
+        _log(
+          'File[$base]: no data '
+          '(end=${result.endReceived} empty=${result.deviceReportedEmpty})',
+        );
+      }
+
+      // Advance rule: if the firmware auto-deleted the file we just
+      // drained, the count drops and the next file is at [base] again.
+      // If the count is unchanged (zero-size entry, error response, or
+      // the recording file), move past it.
+      final statsAfter = await device.getStorageList();
+      final countAfter = statsAfter.length > 1 ? statsAfter[1] : 0;
+      if (countAfter >= countBefore) {
+        base++;
+      } else {
+        _log('firmware auto-deleted file (count $countBefore→$countAfter)');
       }
     }
 
-    if (!aborted && !_cancelled) {
-      totalBytesOnCard = 0;
+    if (!_cancelled && uploaded > 0 && lastError.value == null) {
+      final statsEnd = await device.getStorageList();
+      totalBytesOnCard = statsEnd.isNotEmpty ? statsEnd[0] : 0;
       progress.value = 1.0;
       notifyListeners();
     }
+    if (!_cancelled &&
+        uploaded == 0 &&
+        spilled == 0 &&
+        lastError.value == null &&
+        processed > 0) {
+      lastError.value =
+          'ファイルは見つかりましたがデータを読み出せませんでした '
+          '($processed 件試行)。詳細は虫アイコンのログ';
+    }
     _log(
-      'multi-file done: $filesProcessed/$totalFiles files, '
-      '${deletable.length} deleted, aborted=$aborted',
+      'multi-file done: uploaded=$uploaded spilled=$spilled '
+      'skipped=$skipped processed=$processed cancelled=$_cancelled',
     );
   }
 
