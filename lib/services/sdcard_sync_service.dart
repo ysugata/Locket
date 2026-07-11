@@ -90,7 +90,9 @@ class SDCardSyncService extends ChangeNotifier {
     try {
       // Stop any in-progress storage operation.
       await device.stopStorageSync();
-      await Future<void>.delayed(const Duration(milliseconds: 200));
+      // 500ms settle after STOP — the firmware ignores commands sent
+      // too soon (official client's "PR #5905 pattern").
+      await Future<void>.delayed(const Duration(milliseconds: 500));
 
       // Read storage info.
       final storageInfo = await device.getStorageList();
@@ -139,7 +141,21 @@ class SDCardSyncService extends ChangeNotifier {
   /// New multi-file protocol: list files, read + upload each non-empty
   /// file, then delete fully-synced files in descending index order.
   Future<void> _syncMultiFile() async {
-    final files = await device.listStorageFiles();
+    // The firmware sometimes stays silent on CMD_LIST right after a
+    // STOP or an interrupted transfer — the official client retries
+    // up to 3 times with a 700ms pause ("PR #5905 pattern").
+    var files = <Map<String, int>>[];
+    for (var attempt = 1; attempt <= 3 && files.isEmpty; attempt++) {
+      if (_cancelled) return;
+      if (attempt > 1) {
+        debugPrint('[SDSync] CMD_LIST retry $attempt/3');
+        try {
+          await device.stopStorageSync();
+        } catch (_) {}
+        await Future<void>.delayed(const Duration(milliseconds: 700));
+      }
+      files = await device.listStorageFiles();
+    }
     debugPrint('[SDSync] listStorageFiles: ${files.length} files');
     for (final f in files) {
       debugPrint(
@@ -149,7 +165,7 @@ class SDCardSyncService extends ChangeNotifier {
 
     if (files.isEmpty) {
       // Never end silently — the storage stats said there is data.
-      lastError.value = 'SDファイル一覧の取得に失敗しました（タイムアウト）';
+      lastError.value = 'SDファイル一覧の取得に失敗しました（3回試行してタイムアウト）';
       debugPrint('[SDSync] No files returned by CMD_LIST_FILES');
       return;
     }
