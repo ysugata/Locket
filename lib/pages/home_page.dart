@@ -413,6 +413,8 @@ class _SDSyncCard extends StatelessWidget {
     if (sync == null) return const SizedBox.shrink();
     final progress = sync.progress.value;
     final error = sync.lastError.value;
+    final transferred = sync.transferredBytes.value;
+    final total = sync.totalBytesOnCard;
 
     return Card(
       color: Theme.of(context).colorScheme.secondaryContainer,
@@ -438,6 +440,14 @@ class _SDSyncCard extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             LinearProgressIndicator(value: progress),
+            if (transferred > 0) ...[
+              const SizedBox(height: 4),
+              Text(
+                '${_StatusCard._formatBytes(transferred)}'
+                '${total > 0 ? ' / ${_StatusCard._formatBytes(total)}' : ''} 転送済み',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
             if (error != null) ...[
               const SizedBox(height: 8),
               Text(

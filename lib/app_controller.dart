@@ -214,6 +214,12 @@ class AppController extends ChangeNotifier {
       _running = true;
       notifyListeners();
 
+      // Resume an interrupted SD sync whenever the BLE link comes back
+      // — without this, a mid-sync disconnect leaves the SD card only
+      // partially drained until the next app launch.
+      _prevBleState = device.connectionState.value;
+      device.connectionState.addListener(_onBleReconnected);
+
       // Recover WAL segments left over from a previous run or crash.
       walStore.uploadPending();
 
@@ -227,6 +233,21 @@ class AppController extends ChangeNotifier {
       // Keep retrying instead of staying dead until a settings change.
       _scheduleStartRetry();
       notifyListeners();
+    }
+  }
+
+  OmiConnectionState? _prevBleState;
+
+  void _onBleReconnected() {
+    final state = device.connectionState.value;
+    final prev = _prevBleState;
+    _prevBleState = state;
+    if (!_running) return;
+    if (state == OmiConnectionState.connected &&
+        prev != OmiConnectionState.connected) {
+      debugPrint('[App] BLE reconnected — resuming SD sync + WAL upload');
+      _walStore?.uploadPending();
+      _autoSyncSDCard(); // syncAll() is a no-op while already syncing
     }
   }
 
@@ -303,6 +324,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> stop() async {
     _running = false;
+    device.connectionState.removeListener(_onBleReconnected);
     _startRetryTimer?.cancel();
     _startRetryTimer = null;
     _byteRefresh?.cancel();

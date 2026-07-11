@@ -27,7 +27,20 @@ class SDCardSyncService extends ChangeNotifier {
   final String deviceId;
 
   static const Duration _firstDataTimeout = Duration(seconds: 5);
-  static const Duration _overallReadTimeout = Duration(minutes: 10);
+
+  /// A transfer that keeps sending data never times out — hours of
+  /// audio can take far longer than any fixed cap over BLE. Only a
+  /// stalled stream (no notification for this long) is aborted.
+  static const Duration _inactivityTimeout = Duration(seconds: 30);
+
+  /// Backstop for a single read attempt. Combined with offset resume,
+  /// even files larger than this window still complete.
+  static const Duration _absoluteReadTimeout = Duration(hours: 2);
+
+  /// After a stall, re-issue CMD_READ_FILE from the received offset
+  /// this many times (each retry only happens when bytes advanced).
+  static const int _maxReadAttempts = 10;
+
   static const Duration _httpTimeout = Duration(seconds: 60);
   static const int _httpMaxAttempts = 3;
   static const int _maxChunkBytes = 500 * 1024;
@@ -38,6 +51,9 @@ class SDCardSyncService extends ChangeNotifier {
   final ValueNotifier<double> progress = ValueNotifier(0.0);
   final ValueNotifier<bool> isSyncing = ValueNotifier(false);
   final ValueNotifier<String?> lastError = ValueNotifier(null);
+
+  /// Bytes received in the current sync run (for the progress UI).
+  final ValueNotifier<int> transferredBytes = ValueNotifier(0);
   int totalBytesOnCard = 0;
 
   StreamSubscription<List<int>>? _storageSub;
@@ -68,6 +84,7 @@ class SDCardSyncService extends ChangeNotifier {
     isSyncing.value = true;
     lastError.value = null;
     progress.value = 0.0;
+    transferredBytes.value = 0;
     notifyListeners();
 
     try {
@@ -131,6 +148,8 @@ class SDCardSyncService extends ChangeNotifier {
     }
 
     if (files.isEmpty) {
+      // Never end silently — the storage stats said there is data.
+      lastError.value = 'SDファイル一覧の取得に失敗しました（タイムアウト）';
       debugPrint('[SDSync] No files returned by CMD_LIST_FILES');
       return;
     }
@@ -158,7 +177,7 @@ class SDCardSyncService extends ChangeNotifier {
       final size = file['size'] ?? 0;
       debugPrint('[SDSync] Reading file $idx (${size}B)');
 
-      final result = await _readFile(
+      final result = await _readFileWithResume(
         idx,
         expectedSize: size,
         onProgress: (fraction) {
@@ -250,10 +269,85 @@ class SDCardSyncService extends ChangeNotifier {
     );
   }
 
-  /// Read one file using CMD_READ_FILE (0x11, fileIndex, offset=0).
+  /// Read one file completely, resuming from the received byte offset
+  /// after a stall. A single BLE hiccup mid-transfer no longer restarts
+  /// an hours-long file from zero — CMD_READ_FILE takes an offset, so
+  /// each retry continues where the stream stopped (the official
+  /// client resumes the same way via `wal.storageOffset`).
+  Future<_FileReadResult> _readFileWithResume(
+    int index, {
+    required int expectedSize,
+    void Function(double fraction)? onProgress,
+  }) async {
+    final frames = <Uint8List>[];
+    var offset = 0;
+    int? epochSeconds;
+    var endReceived = false;
+    var deviceReportedEmpty = false;
+
+    for (var attempt = 1; attempt <= _maxReadAttempts; attempt++) {
+      if (_cancelled) break;
+      if (attempt > 1) {
+        debugPrint(
+          '[SDSync] File $index: resuming at offset $offset '
+          '(attempt $attempt/$_maxReadAttempts)',
+        );
+        // Make sure the previous (stalled) read session is closed
+        // before asking for the next range.
+        try {
+          await device.stopStorageSync();
+        } catch (_) {}
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      }
+
+      final r = await _readFile(
+        index,
+        expectedSize: expectedSize,
+        startOffset: offset,
+        onProgress: onProgress,
+      );
+      frames.addAll(r.frames);
+      offset += r.audioBytes;
+      epochSeconds ??= r.epochSeconds;
+      deviceReportedEmpty |= r.deviceReportedEmpty;
+
+      if (r.endReceived || _cancelled) {
+        endReceived = r.endReceived;
+        break;
+      }
+      if (r.audioBytes == 0) {
+        // No progress on this attempt — retrying won't help.
+        debugPrint('[SDSync] File $index: no progress, giving up');
+        break;
+      }
+    }
+
+    final complete =
+        endReceived &&
+        !_cancelled &&
+        (expectedSize <= 0 || offset >= expectedSize);
+    debugPrint(
+      '[SDSync] File $index total: ${frames.length} frames, '
+      '$offset/$expectedSize B, end=$endReceived, complete=$complete',
+    );
+    return _FileReadResult(
+      frames: frames,
+      complete: complete,
+      endReceived: endReceived,
+      deviceReportedEmpty: deviceReportedEmpty,
+      audioBytes: offset,
+      epochSeconds: epochSeconds,
+    );
+  }
+
+  /// One read attempt using CMD_READ_FILE (0x11, fileIndex, offset).
+  /// Times out only when the stream stalls: 5s for the first
+  /// notification, then 30s of inactivity — a flowing transfer runs
+  /// as long as it needs (2h backstop per attempt).
   Future<_FileReadResult> _readFile(
     int index, {
     required int expectedSize,
+    int startOffset = 0,
     void Function(double fraction)? onProgress,
   }) async {
     final frames = <Uint8List>[];
@@ -266,24 +360,26 @@ class SDCardSyncService extends ChangeNotifier {
     final completer = Completer<void>();
     _activeCompleter = completer;
 
-    // The firmware must send *something* shortly after CMD_READ_FILE;
-    // after that, a large transfer may legitimately take minutes, so
-    // there is no mid-transfer timeout (matches the official client).
-    Timer? firstDataTimer = Timer(_firstDataTimeout, () {
-      if (!completer.isCompleted) {
-        completer.completeError(
-          TimeoutException('No storage data within 5s of CMD_READ_FILE'),
-        );
-      }
-    });
+    Timer? stallTimer;
+    void armStallTimer(Duration timeout, String label) {
+      stallTimer?.cancel();
+      stallTimer = Timer(timeout, () {
+        if (!completer.isCompleted) {
+          completer.completeError(
+            TimeoutException('$label (${timeout.inSeconds}s)'),
+          );
+        }
+      });
+    }
+
+    armStallTimer(_firstDataTimeout, 'No storage data after CMD_READ_FILE');
 
     _storageSub = device.storageStream.listen(
       (value) {
         if (_cancelled) return;
         final n = parseSdNotification(value, SdProtocol.multiFile);
         if (n.isEcho) return;
-        firstDataTimer?.cancel();
-        firstDataTimer = null;
+        armStallTimer(_inactivityTimeout, 'Storage stream stalled');
 
         if (n.isResponse) {
           switch (n.responseCode) {
@@ -307,8 +403,11 @@ class SDCardSyncService extends ChangeNotifier {
         frames.addAll(n.frames);
         audioBytes += n.audioBytes;
         epochSeconds ??= n.epochSeconds;
+        transferredBytes.value = transferredBytes.value + n.audioBytes;
         if (expectedSize > 0) {
-          onProgress?.call((audioBytes / expectedSize).clamp(0.0, 1.0));
+          onProgress?.call(
+            ((startOffset + audioBytes) / expectedSize).clamp(0.0, 1.0),
+          );
         }
       },
       onError: (Object e) {
@@ -327,14 +426,14 @@ class SDCardSyncService extends ChangeNotifier {
     device.connectionState.addListener(onBleState);
 
     try {
-      await device.readStorageFile(index, offset: 0);
-      await completer.future.timeout(_overallReadTimeout);
+      await device.readStorageFile(index, offset: startOffset);
+      await completer.future.timeout(_absoluteReadTimeout);
     } on TimeoutException catch (e) {
-      debugPrint('[SDSync] Read file $index timed out: ${e.message}');
+      debugPrint('[SDSync] Read file $index stalled: ${e.message}');
     } catch (e) {
       debugPrint('[SDSync] Read file $index failed: $e');
     } finally {
-      firstDataTimer?.cancel();
+      stallTimer?.cancel();
       device.connectionState.removeListener(onBleState);
       await _storageSub?.cancel();
       _storageSub = null;
@@ -347,10 +446,10 @@ class SDCardSyncService extends ChangeNotifier {
         endReceived &&
         deviceError == null &&
         !_cancelled &&
-        (expectedSize <= 0 || audioBytes >= expectedSize);
+        (expectedSize <= 0 || startOffset + audioBytes >= expectedSize);
     debugPrint(
-      '[SDSync] File $index: ${frames.length} frames, '
-      '$audioBytes/$expectedSize B, end=$endReceived, complete=$complete',
+      '[SDSync] File $index attempt: ${frames.length} frames, '
+      '+$audioBytes B (from $startOffset), end=$endReceived',
     );
     return _FileReadResult(
       frames: frames,
@@ -373,21 +472,26 @@ class SDCardSyncService extends ChangeNotifier {
     final completer = Completer<void>();
     _activeCompleter = completer;
 
-    Timer? firstDataTimer = Timer(_firstDataTimeout, () {
-      if (!completer.isCompleted) {
-        completer.completeError(
-          TimeoutException('No storage data within 5s of legacy read'),
-        );
-      }
-    });
+    Timer? stallTimer;
+    void armStallTimer(Duration timeout, String label) {
+      stallTimer?.cancel();
+      stallTimer = Timer(timeout, () {
+        if (!completer.isCompleted) {
+          completer.completeError(
+            TimeoutException('$label (${timeout.inSeconds}s)'),
+          );
+        }
+      });
+    }
+
+    armStallTimer(_firstDataTimeout, 'No storage data after legacy read');
 
     _storageSub = device.storageStream.listen(
       (value) {
         if (_cancelled) return;
         final n = parseSdNotification(value, SdProtocol.legacy);
         if (n.isEcho) return;
-        firstDataTimer?.cancel();
-        firstDataTimer = null;
+        armStallTimer(_inactivityTimeout, 'Storage stream stalled');
 
         if (n.isResponse) {
           switch (n.responseCode) {
@@ -410,6 +514,7 @@ class SDCardSyncService extends ChangeNotifier {
         frames.addAll(n.frames);
         audioBytes += n.audioBytes;
         epochSeconds ??= n.epochSeconds;
+        transferredBytes.value = transferredBytes.value + n.audioBytes;
         if (expected > 0) {
           progress.value = (audioBytes / expected).clamp(0.0, 0.99);
           notifyListeners();
@@ -432,12 +537,12 @@ class SDCardSyncService extends ChangeNotifier {
 
     try {
       await device.writeStorageCommand(0x00, 1, storageOffset);
-      await completer.future.timeout(_overallReadTimeout);
+      await completer.future.timeout(_absoluteReadTimeout);
     } on TimeoutException {
-      lastError.value = 'SD同期がタイムアウトしました（データは削除していません）';
+      lastError.value = 'SD同期が停止しました（データは削除していません）';
       return;
     } finally {
-      firstDataTimer?.cancel();
+      stallTimer?.cancel();
       device.connectionState.removeListener(onBleState);
       await _storageSub?.cancel();
       _storageSub = null;
@@ -593,6 +698,7 @@ class SDCardSyncService extends ChangeNotifier {
     progress.dispose();
     isSyncing.dispose();
     lastError.dispose();
+    transferredBytes.dispose();
     super.dispose();
   }
 }
