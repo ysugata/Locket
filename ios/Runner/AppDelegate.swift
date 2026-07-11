@@ -7,12 +7,40 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var audioSessionChannel: FlutterMethodChannel?
   private var wifiChannel: FlutterMethodChannel?
+  private var sessionWasConfigured = false
 
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    // Phone calls / Siri deactivate the AVAudioSession; without
+    // reactivation iOS stops crediting the app for background audio
+    // and suspends the BLE relay a few minutes later. Same recovery
+    // the official omi app performs after interruptions.
+    NotificationCenter.default.addObserver(
+      forName: AVAudioSession.interruptionNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: .main
+    ) { [weak self] notification in
+      guard self?.sessionWasConfigured == true,
+            let info = notification.userInfo,
+            let typeValue = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: typeValue),
+            type == .ended else {
+        return
+      }
+      try? AVAudioSession.sharedInstance().setActive(true)
+    }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  override func applicationDidBecomeActive(_ application: UIApplication) {
+    super.applicationDidBecomeActive(application)
+    // Re-assert the session when returning to the foreground in case
+    // it was silently deactivated while backgrounded.
+    if sessionWasConfigured {
+      try? AVAudioSession.sharedInstance().setActive(true)
+    }
   }
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
@@ -25,7 +53,7 @@ import UIKit
       name: "com.ys.locket/audioSession",
       binaryMessenger: registrar.messenger()
     )
-    channel.setMethodCallHandler { (call, result) in
+    channel.setMethodCallHandler { [weak self] (call, result) in
       switch call.method {
       case "configureForBluetooth":
         let session = AVAudioSession.sharedInstance()
@@ -36,6 +64,7 @@ import UIKit
             options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker, .mixWithOthers]
           )
           try session.setActive(true)
+          self?.sessionWasConfigured = true
           result(true)
         } catch {
           result(FlutterError(
@@ -50,6 +79,7 @@ import UIKit
             false,
             options: .notifyOthersOnDeactivation
           )
+          self?.sessionWasConfigured = false
           result(true)
         } catch {
           result(FlutterError(

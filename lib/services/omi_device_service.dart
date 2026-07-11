@@ -381,45 +381,60 @@ class OmiDeviceService extends ChangeNotifier {
   }
 
   /// Send CMD_LIST_FILES (0x10) and return the file list.
-  /// Response: [count:1][ts:4 BE][size:4 BE]... per file.
+  /// Response: [count:1][ts:4 BE][size:4 BE]... per file. A large list
+  /// exceeds one notification (payload is capped at MTU-3, ~182 B on
+  /// iOS → ~22 files), so notifications are accumulated until the
+  /// length announced by the count byte is complete.
   Future<List<Map<String, int>>> listStorageFiles() async {
     final ch = _storageDataChar;
     if (ch == null) return [];
 
     final completer = Completer<List<Map<String, int>>>();
     StreamSubscription<List<int>>? sub;
+    final buffer = <int>[];
 
-    sub = storageStream.listen((value) {
-      if (completer.isCompleted) return;
-      if (value.isEmpty) return;
-
-      final count = value[0];
-      if (count == 0 && value.length == 1) {
+    void tryParse() {
+      if (completer.isCompleted || buffer.isEmpty) return;
+      final count = buffer[0];
+      if (count == 0) {
         completer.complete([]);
         return;
       }
-
-      final expectedLen = 1 + count * 8;
-      if (value.length >= expectedLen && count > 0 && count <= 128) {
-        final files = <Map<String, int>>[];
-        for (var i = 0; i < count; i++) {
-          final base = 1 + i * 8;
-          if (base + 8 > value.length) break;
-          final ts =
-              (value[base] << 24) |
-              (value[base + 1] << 16) |
-              (value[base + 2] << 8) |
-              value[base + 3];
-          final size =
-              (value[base + 4] << 24) |
-              (value[base + 5] << 16) |
-              (value[base + 6] << 8) |
-              value[base + 7];
-          files.add({'index': i, 'timestamp': ts, 'size': size});
-        }
-        debugPrint('[BLE] Listed ${files.length} storage files');
-        completer.complete(files);
+      if (count > 128) {
+        // Not a list response (stray data notification) — resync.
+        buffer.clear();
+        return;
       }
+      final expectedLen = 1 + count * 8;
+      if (buffer.length < expectedLen) return; // wait for more chunks
+      final files = <Map<String, int>>[];
+      for (var i = 0; i < count; i++) {
+        final base = 1 + i * 8;
+        final ts =
+            (buffer[base] << 24) |
+            (buffer[base + 1] << 16) |
+            (buffer[base + 2] << 8) |
+            buffer[base + 3];
+        final size =
+            (buffer[base + 4] << 24) |
+            (buffer[base + 5] << 16) |
+            (buffer[base + 6] << 8) |
+            buffer[base + 7];
+        files.add({'index': i, 'timestamp': ts, 'size': size});
+      }
+      debugPrint('[BLE] Listed ${files.length} storage files');
+      completer.complete(files);
+    }
+
+    sub = storageStream.listen((value) {
+      if (completer.isCompleted || value.isEmpty) return;
+      // A 1-byte status/ack while we have no partial list yet is not
+      // the beginning of a list response.
+      if (buffer.isEmpty && value.length == 1 && value[0] != 0) {
+        return;
+      }
+      buffer.addAll(value);
+      tryParse();
     });
 
     try {

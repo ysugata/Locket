@@ -199,17 +199,33 @@ class _StatusCard extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
               ),
             ],
-            if (bleState == OmiConnectionState.disconnected) ...[
-              const SizedBox(height: 8),
-              Align(
-                alignment: Alignment.centerRight,
-                child: FilledButton.tonalIcon(
-                  onPressed: () => app.retryConnect(),
-                  icon: const Icon(Icons.refresh, size: 18),
-                  label: const Text('再接続'),
-                ),
-              ),
-            ],
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                if (app.running &&
+                    bleState == OmiConnectionState.disconnected) ...[
+                  FilledButton.tonalIcon(
+                    onPressed: () => app.retryConnect(),
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('再接続'),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                if (app.running)
+                  OutlinedButton.icon(
+                    onPressed: () => app.stop(),
+                    icon: const Icon(Icons.stop_circle_outlined, size: 18),
+                    label: const Text('停止'),
+                  )
+                else
+                  FilledButton.icon(
+                    onPressed: () => app.start(),
+                    icon: const Icon(Icons.play_arrow, size: 18),
+                    label: const Text('文字起こしを開始'),
+                  ),
+              ],
+            ),
           ],
         ),
       ),
