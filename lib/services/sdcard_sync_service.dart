@@ -102,16 +102,41 @@ class SDCardSyncService extends ChangeNotifier {
     _storageSub = null;
   }
 
-  Future<void> syncAll() async {
+  /// True while a rescue sync (audio paused, sacrificial deletes
+  /// allowed) is running — the UI labels the sync card accordingly.
+  final ValueNotifier<bool> isRescue = ValueNotifier(false);
+
+  /// Number of unreadable files sacrificed during the current rescue.
+  final ValueNotifier<int> sacrificedFiles = ValueNotifier(0);
+
+  Future<void> syncAll() => _run(rescue: false);
+
+  /// Rescue sync for a wedged, full card: pauses the live audio
+  /// subscription (frees the BLE TX pool and the firmware's SD worker)
+  /// and deletes up to [maxSacrifice] unreadable files to give the
+  /// full LittleFS allocation headroom, after which reads recover.
+  Future<void> rescueSync({int maxSacrifice = 5}) =>
+      _run(rescue: true, maxSacrifice: maxSacrifice);
+
+  Future<void> _run({required bool rescue, int maxSacrifice = 0}) async {
     if (isSyncing.value) return;
     _cancelled = false;
     isSyncing.value = true;
+    isRescue.value = rescue;
+    sacrificedFiles.value = 0;
     lastError.value = null;
     progress.value = 0.0;
     transferredBytes.value = 0;
     notifyListeners();
 
     try {
+      if (rescue) {
+        _log('=== RESCUE MODE: pausing live audio ===');
+        await device.pauseAudioNotifications();
+        // Give the firmware a moment to drain in-flight audio TX.
+        await Future<void>.delayed(const Duration(seconds: 2));
+      }
+
       // Stop any in-progress storage operation.
       await device.stopStorageSync();
       // 500ms settle after STOP — the firmware ignores commands sent
@@ -140,7 +165,11 @@ class SDCardSyncService extends ChangeNotifier {
       // byte offset, use legacy).
       if (field1 < 1000) {
         _log('multi-file: $field1 files, $totalBytesOnCard B');
-        await _syncMultiFile(field1);
+        await _syncMultiFile(
+          field1,
+          rescue: rescue,
+          maxSacrifice: maxSacrifice,
+        );
       } else {
         _log('legacy: offset=$field1');
         await _syncLegacy(field1);
@@ -157,7 +186,16 @@ class SDCardSyncService extends ChangeNotifier {
       try {
         await device.stopStorageSync();
       } catch (_) {}
+      if (rescue) {
+        try {
+          await device.resumeAudioNotifications();
+          _log('=== RESCUE MODE: live audio resumed ===');
+        } catch (e) {
+          _log('audio resume failed: $e');
+        }
+      }
       isSyncing.value = false;
+      isRescue.value = false;
       notifyListeners();
     }
   }
@@ -172,12 +210,19 @@ class SDCardSyncService extends ChangeNotifier {
   ///   remaining files. So: read index [base] repeatedly; when the
   ///   stats file count drops, the next file slid into [base]; when it
   ///   doesn't (empty entry / recording file), advance base.
-  /// - Client-side CMD_DELETE is never sent — after the firmware's
-  ///   auto-delete it would hit a re-indexed, unsynced file.
+  /// - Client-side CMD_DELETE is sent ONLY in rescue mode, and only
+  ///   for the file that just failed to read (index [base]) — it is
+  ///   both the space-freeing sacrifice and the blocker removal. The
+  ///   normal path never deletes: after the firmware's auto-delete it
+  ///   would hit a re-indexed, unsynced file.
   /// - Because the device deletes on its own, an upload failure must
   ///   not lose audio: failed uploads are spilled to the disk WAL and
   ///   recovered later via the same /sdcard/upload endpoint.
-  Future<void> _syncMultiFile(int fileCountFromStats) async {
+  Future<void> _syncMultiFile(
+    int fileCountFromStats, {
+    bool rescue = false,
+    int maxSacrifice = 0,
+  }) async {
     if (fileCountFromStats <= 0) {
       _log('stats report no files');
       return;
@@ -188,6 +233,7 @@ class SDCardSyncService extends ChangeNotifier {
     var spilled = 0;
     var skipped = 0;
     var processed = 0;
+    var consecutiveStalls = 0;
 
     while (processed < fileCountFromStats && !_cancelled) {
       // Re-read stats each round: the firmware re-indexes after its
@@ -222,6 +268,7 @@ class SDCardSyncService extends ChangeNotifier {
       processed++;
 
       if (result.frames.isNotEmpty) {
+        consecutiveStalls = 0;
         final ts = _resolveTimestampStart(0, result.epochSeconds);
         final ok = await _uploadFrames(result.frames, timestampStart: ts);
         if (ok) {
@@ -248,22 +295,72 @@ class SDCardSyncService extends ChangeNotifier {
         }
       } else {
         skipped++;
+        final stall = !result.endReceived && !result.deviceReportedEmpty;
         _log(
           'File[$base]: no data '
           '(end=${result.endReceived} empty=${result.deviceReportedEmpty})',
         );
+
+        if (stall) {
+          consecutiveStalls++;
+          if (!rescue && consecutiveStalls >= 2) {
+            // A wedged card makes every read stall for 30s+ — bailing
+            // early keeps the auto-sync from grinding for an hour.
+            lastError.value =
+                'SDが読み出しに応答しません（満杯によるウェッジの可能性）。'
+                '設定の「SDレスキュー同期」を試してください';
+            _log('2 consecutive stalls — aborting auto sync');
+            break;
+          }
+          if (rescue) {
+            // The full LittleFS wedges the SD worker; freeing space is
+            // the only lever. Sacrifice the unreadable file itself
+            // (oldest first) with a long timeout — metadata rewrites
+            // on a full filesystem can take tens of seconds.
+            if (sacrificedFiles.value >= maxSacrifice) {
+              lastError.value =
+                  'ファイルを $maxSacrifice 件削除しても読み出しが復活しません。'
+                  'ファーム更新（SDクリア）を検討してください';
+              _log('sacrifice budget exhausted — aborting rescue');
+              break;
+            }
+            _log(
+              'RESCUE: sacrificing unreadable file[$base] '
+              '(${sacrificedFiles.value + 1}/$maxSacrifice, 60s timeout)',
+            );
+            final deleted = await device.deleteStorageFile(
+              base,
+              timeout: const Duration(seconds: 60),
+            );
+            if (deleted) {
+              sacrificedFiles.value = sacrificedFiles.value + 1;
+              consecutiveStalls = 0;
+              _log('RESCUE: file[$base] deleted — retrying reads');
+              await Future<void>.delayed(const Duration(seconds: 2));
+              // Count drop is detected below; base stays put and the
+              // next file slides in.
+            } else {
+              _log('RESCUE: delete of file[$base] failed/timed out');
+              // Give the worker a breather before the next attempt.
+              await Future<void>.delayed(const Duration(seconds: 5));
+            }
+          }
+        } else {
+          consecutiveStalls = 0;
+        }
       }
 
       // Advance rule: if the firmware auto-deleted the file we just
-      // drained, the count drops and the next file is at [base] again.
-      // If the count is unchanged (zero-size entry, error response, or
-      // the recording file), move past it.
+      // drained (or the rescue delete succeeded), the count drops and
+      // the next file is at [base] again. If the count is unchanged
+      // (zero-size entry, error response, or the recording file),
+      // move past it.
       final statsAfter = await device.getStorageList();
       final countAfter = statsAfter.length > 1 ? statsAfter[1] : 0;
       if (countAfter >= countBefore) {
         base++;
       } else {
-        _log('firmware auto-deleted file (count $countBefore→$countAfter)');
+        _log('file removed on device (count $countBefore→$countAfter)');
       }
     }
 
@@ -717,6 +814,8 @@ class SDCardSyncService extends ChangeNotifier {
     isSyncing.dispose();
     lastError.dispose();
     transferredBytes.dispose();
+    isRescue.dispose();
+    sacrificedFiles.dispose();
     debugLog.dispose();
     super.dispose();
   }

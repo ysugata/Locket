@@ -444,7 +444,7 @@ class _SDSyncCard extends StatelessWidget {
                 const Icon(Icons.sd_card, size: 20),
                 const SizedBox(width: 8),
                 Text(
-                  'SDカード同期中...',
+                  sync.isRescue.value ? 'SDレスキュー同期中...' : 'SDカード同期中...',
                   style: Theme.of(context).textTheme.titleSmall,
                 ),
                 const Spacer(),
@@ -461,6 +461,20 @@ class _SDSyncCard extends StatelessWidget {
               Text(
                 '${_StatusCard._formatBytes(transferred)}'
                 '${total > 0 ? ' / ${_StatusCard._formatBytes(total)}' : ''} 転送済み',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+            if (sync.isRescue.value && sync.sacrificedFiles.value > 0) ...[
+              const SizedBox(height: 4),
+              Text(
+                '読めないファイルを ${sync.sacrificedFiles.value} 件削除して空きを確保',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+            if (sync.isRescue.value) ...[
+              const SizedBox(height: 4),
+              Text(
+                'レスキュー中はリアルタイム文字起こしを一時停止しています',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ],
