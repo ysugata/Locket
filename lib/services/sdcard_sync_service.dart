@@ -56,6 +56,24 @@ class SDCardSyncService extends ChangeNotifier {
   final ValueNotifier<int> transferredBytes = ValueNotifier(0);
   int totalBytesOnCard = 0;
 
+  /// Recent sync events, shown in the in-app debug sheet so failures
+  /// can be diagnosed from TestFlight builds without a tethered device.
+  final ValueNotifier<List<String>> debugLog = ValueNotifier<List<String>>(
+    const [],
+  );
+  static const int _debugLogMax = 100;
+
+  void _log(String entry) {
+    final ts = DateTime.now().toIso8601String().substring(11, 23);
+    final line = '$ts $entry';
+    debugPrint('[SDSync] $line');
+    final next = [line, ...debugLog.value];
+    if (next.length > _debugLogMax) {
+      next.removeRange(_debugLogMax, next.length);
+    }
+    debugLog.value = next;
+  }
+
   StreamSubscription<List<int>>? _storageSub;
   bool _cancelled = false;
 
@@ -96,7 +114,7 @@ class SDCardSyncService extends ChangeNotifier {
 
       // Read storage info.
       final storageInfo = await device.getStorageList();
-      debugPrint('[SDSync] storageInfo: $storageInfo');
+      _log('storageInfo: $storageInfo');
       if (storageInfo.isEmpty) {
         lastError.value = 'ストレージ情報が取得できません';
         return;
@@ -106,7 +124,7 @@ class SDCardSyncService extends ChangeNotifier {
       notifyListeners();
 
       if (totalBytesOnCard < 100) {
-        debugPrint('[SDSync] No meaningful data ($totalBytesOnCard B)');
+        _log('No meaningful data ($totalBytesOnCard B)');
         return;
       }
 
@@ -115,15 +133,15 @@ class SDCardSyncService extends ChangeNotifier {
       // (field1 = fileCount). field1 >= 1000 → old firmware (field1 =
       // byte offset, use legacy).
       if (field1 < 1000) {
-        debugPrint('[SDSync] multi-file: $field1 files, $totalBytesOnCard B');
+        _log('multi-file: $field1 files, $totalBytesOnCard B');
         await _syncMultiFile(field1);
       } else {
-        debugPrint('[SDSync] legacy: offset=$field1');
+        _log('legacy: offset=$field1');
         await _syncLegacy(field1);
       }
     } catch (e) {
       lastError.value = e.toString();
-      debugPrint('[SDSync] error: $e');
+      _log('error: $e');
     } finally {
       await _storageSub?.cancel();
       _storageSub = null;
@@ -150,7 +168,7 @@ class SDCardSyncService extends ChangeNotifier {
     for (var attempt = 1; attempt <= 3 && files.isEmpty; attempt++) {
       if (_cancelled) return;
       if (attempt > 1) {
-        debugPrint('[SDSync] CMD_LIST retry $attempt/3');
+        _log('CMD_LIST retry $attempt/3');
         try {
           await device.stopStorageSync();
         } catch (_) {}
@@ -158,11 +176,9 @@ class SDCardSyncService extends ChangeNotifier {
       }
       files = await device.listStorageFiles();
     }
-    debugPrint('[SDSync] listStorageFiles: ${files.length} files');
+    _log('listStorageFiles: ${files.length} files');
     for (final f in files) {
-      debugPrint(
-        '[SDSync]   index=${f['index']} ts=${f['timestamp']} size=${f['size']}',
-      );
+      _log('  index=${f['index']} ts=${f['timestamp']} size=${f['size']}');
     }
 
     // Fallback when CMD_LIST stays unanswered: the storage stats
@@ -173,8 +189,8 @@ class SDCardSyncService extends ChangeNotifier {
     var listUnavailable = false;
     if (files.isEmpty && fileCountFromStats > 0) {
       listUnavailable = true;
-      debugPrint(
-        '[SDSync] CMD_LIST unanswered — falling back to index scan '
+      _log(
+        'CMD_LIST unanswered — falling back to index scan '
         'of $fileCountFromStats files',
       );
       files = [
@@ -186,7 +202,7 @@ class SDCardSyncService extends ChangeNotifier {
     if (files.isEmpty) {
       // Never end silently — the storage stats said there is data.
       lastError.value = 'SDファイル一覧の取得に失敗しました（3回試行してタイムアウト）';
-      debugPrint('[SDSync] No files returned by CMD_LIST_FILES');
+      _log('No files returned by CMD_LIST_FILES');
       return;
     }
 
@@ -203,9 +219,7 @@ class SDCardSyncService extends ChangeNotifier {
       }
       totalBytesOnCard = actualTotal;
     }
-    debugPrint(
-      '[SDSync] ${nonEmpty.length} files to read, $totalBytesOnCard B',
-    );
+    _log('${nonEmpty.length} files to read, $totalBytesOnCard B');
     if (nonEmpty.isEmpty) return;
 
     // Indices of files that are safe to delete (fully received and
@@ -219,7 +233,7 @@ class SDCardSyncService extends ChangeNotifier {
       if (_cancelled) break;
       final idx = file['index'] ?? 0;
       final size = file['size'] ?? 0;
-      debugPrint('[SDSync] Reading file $idx (${size}B)');
+      _log('Reading file $idx (${size}B)');
 
       final result = await _readFileWithResume(
         idx,
@@ -245,7 +259,7 @@ class SDCardSyncService extends ChangeNotifier {
       if (result.deviceReportedEmpty && result.frames.isEmpty) {
         // The device explicitly says the file is empty — nothing to
         // lose, so mark it deletable to avoid re-listing it forever.
-        debugPrint('[SDSync] File $idx: device reports empty, will delete');
+        _log('File $idx: device reports empty, will delete');
         deletable.add(idx);
         filesProcessed++;
         continue;
@@ -254,9 +268,11 @@ class SDCardSyncService extends ChangeNotifier {
       if (!result.complete) {
         lastError.value =
             'ファイル $idx の読み出しが完了しませんでした '
-            '(${result.audioBytes}/$size B)。ファイルは削除せず中断します';
-        debugPrint(
-          '[SDSync] File $idx incomplete '
+            '(受信 ${result.audioBytes}B / 期待 ${size}B, '
+            'END ${result.endReceived ? "受信済" : "未受信"})。'
+            'ファイルは削除せず中断。詳細は虫アイコンのログ';
+        _log(
+          'File $idx incomplete '
           '(end=${result.endReceived} ${result.audioBytes}/$size B) — '
           'keeping on device, aborting sync',
         );
@@ -265,7 +281,7 @@ class SDCardSyncService extends ChangeNotifier {
       }
 
       if (result.frames.isEmpty) {
-        debugPrint('[SDSync] File $idx: complete but 0 frames, skipping');
+        _log('File $idx: complete but 0 frames, skipping');
         filesProcessed++;
         continue;
       }
@@ -300,12 +316,12 @@ class SDCardSyncService extends ChangeNotifier {
         try {
           final deleted = await device.deleteStorageFile(idx);
           if (deleted) {
-            debugPrint('[SDSync] Deleted file $idx');
+            _log('Deleted file $idx');
           } else {
-            debugPrint('[SDSync] Delete file $idx: device returned failure');
+            _log('Delete file $idx: device returned failure');
           }
         } catch (e) {
-          debugPrint('[SDSync] Delete file $idx failed: $e');
+          _log('Delete file $idx failed: $e');
         }
       }
     }
@@ -315,8 +331,8 @@ class SDCardSyncService extends ChangeNotifier {
       progress.value = 1.0;
       notifyListeners();
     }
-    debugPrint(
-      '[SDSync] multi-file done: $filesProcessed/$totalFiles files, '
+    _log(
+      'multi-file done: $filesProcessed/$totalFiles files, '
       '${deletable.length} deleted, aborted=$aborted',
     );
   }
@@ -340,8 +356,8 @@ class SDCardSyncService extends ChangeNotifier {
     for (var attempt = 1; attempt <= _maxReadAttempts; attempt++) {
       if (_cancelled) break;
       if (attempt > 1) {
-        debugPrint(
-          '[SDSync] File $index: resuming at offset $offset '
+        _log(
+          'File $index: resuming at offset $offset '
           '(attempt $attempt/$_maxReadAttempts)',
         );
         // Make sure the previous (stalled) read session is closed
@@ -369,7 +385,7 @@ class SDCardSyncService extends ChangeNotifier {
       }
       if (r.audioBytes == 0) {
         // No progress on this attempt — retrying won't help.
-        debugPrint('[SDSync] File $index: no progress, giving up');
+        _log('File $index: no progress, giving up');
         break;
       }
     }
@@ -378,8 +394,8 @@ class SDCardSyncService extends ChangeNotifier {
         endReceived &&
         !_cancelled &&
         (expectedSize <= 0 || offset >= expectedSize);
-    debugPrint(
-      '[SDSync] File $index total: ${frames.length} frames, '
+    _log(
+      'File $index total: ${frames.length} frames, '
       '$offset/$expectedSize B, end=$endReceived, complete=$complete',
     );
     return _FileReadResult(
@@ -484,9 +500,9 @@ class SDCardSyncService extends ChangeNotifier {
       await device.readStorageFile(index, offset: startOffset);
       await completer.future.timeout(_absoluteReadTimeout);
     } on TimeoutException catch (e) {
-      debugPrint('[SDSync] Read file $index stalled: ${e.message}');
+      _log('Read file $index stalled: ${e.message}');
     } catch (e) {
-      debugPrint('[SDSync] Read file $index failed: $e');
+      _log('Read file $index failed: $e');
     } finally {
       stallTimer?.cancel();
       device.connectionState.removeListener(onBleState);
@@ -495,15 +511,15 @@ class SDCardSyncService extends ChangeNotifier {
     }
 
     if (deviceError != null) {
-      debugPrint('[SDSync] File $index: $deviceError');
+      _log('File $index: $deviceError');
     }
     final complete =
         endReceived &&
         deviceError == null &&
         !_cancelled &&
         (expectedSize <= 0 || startOffset + audioBytes >= expectedSize);
-    debugPrint(
-      '[SDSync] File $index attempt: ${frames.length} frames, '
+    _log(
+      'File $index attempt: ${frames.length} frames, '
       '+$audioBytes B (from $startOffset), end=$endReceived',
     );
     return _FileReadResult(
@@ -557,8 +573,8 @@ class SDCardSyncService extends ChangeNotifier {
               endReceived = true;
               if (!completer.isCompleted) completer.complete();
             default:
-              debugPrint(
-                '[SDSync] legacy response 0x'
+              _log(
+                'legacy response 0x'
                 '${n.responseCode!.toRadixString(16)}',
               );
               if (!completer.isCompleted) completer.complete();
@@ -608,8 +624,8 @@ class SDCardSyncService extends ChangeNotifier {
       return;
     }
 
-    debugPrint(
-      '[SDSync] legacy read: ${frames.length} frames, '
+    _log(
+      'legacy read: ${frames.length} frames, '
       '$audioBytes/$expected B, end=$endReceived',
     );
 
@@ -618,7 +634,7 @@ class SDCardSyncService extends ChangeNotifier {
       return;
     }
     if (frames.isEmpty) {
-      debugPrint('[SDSync] No frames received');
+      _log('No frames received');
       return;
     }
 
@@ -668,9 +684,7 @@ class SDCardSyncService extends ChangeNotifier {
     }
     if (current.isNotEmpty) chunks.add(current);
 
-    debugPrint(
-      '[SDSync] Uploading ${frames.length} frames in ${chunks.length} chunks',
-    );
+    _log('Uploading ${frames.length} frames in ${chunks.length} chunks');
 
     var framesSent = 0;
     for (var i = 0; i < chunks.length; i++) {
@@ -680,8 +694,8 @@ class SDCardSyncService extends ChangeNotifier {
       // Each chunk starts where the previous one ended in recording time.
       final chunkTimestamp =
           timestampStart + (framesSent * _opusFrameMillis) ~/ 1000;
-      debugPrint(
-        '[SDSync] Chunk ${i + 1}/${chunks.length}: '
+      _log(
+        'Chunk ${i + 1}/${chunks.length}: '
         '${chunk.length} frames (${body.length} B) ts=$chunkTimestamp',
       );
 
@@ -690,7 +704,7 @@ class SDCardSyncService extends ChangeNotifier {
       framesSent += chunk.length;
     }
 
-    debugPrint('[SDSync] All ${chunks.length} chunks uploaded');
+    _log('All ${chunks.length} chunks uploaded');
     return true;
   }
 
@@ -724,9 +738,7 @@ class SDCardSyncService extends ChangeNotifier {
 
         if (response.statusCode == 200) return true;
 
-        debugPrint(
-          '[SDSync] Upload error: ${response.statusCode} ${response.body}',
-        );
+        _log('Upload error: ${response.statusCode} ${response.body}');
         if (response.statusCode >= 400 && response.statusCode < 500) {
           // Client error — retrying the same payload won't help.
           lastError.value =
@@ -734,7 +746,7 @@ class SDCardSyncService extends ChangeNotifier {
           return false;
         }
       } catch (e) {
-        debugPrint('[SDSync] Upload attempt $attempt failed: $e');
+        _log('Upload attempt $attempt failed: $e');
       }
       if (attempt < _httpMaxAttempts) {
         await Future<void>.delayed(Duration(seconds: 2 * attempt));
@@ -754,6 +766,7 @@ class SDCardSyncService extends ChangeNotifier {
     isSyncing.dispose();
     lastError.dispose();
     transferredBytes.dispose();
+    debugLog.dispose();
     super.dispose();
   }
 }

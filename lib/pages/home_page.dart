@@ -661,7 +661,13 @@ class _DebugLogSheet extends StatelessWidget {
           animation: app,
           builder: (context, _) {
             final streamer = app.streamer;
-            final entries = streamer?.debugLog.value ?? const <String>[];
+            final wsEntries = streamer?.debugLog.value ?? const <String>[];
+            final sdEntries =
+                app.sdCardSync?.debugLog.value ?? const <String>[];
+            final entries = <String>[
+              if (sdEntries.isNotEmpty) ...['━━ SD同期 ━━', ...sdEntries],
+              if (wsEntries.isNotEmpty) ...['━━ WebSocket ━━', ...wsEntries],
+            ];
             return Column(
               children: [
                 Padding(
@@ -671,7 +677,7 @@ class _DebugLogSheet extends StatelessWidget {
                       const Icon(Icons.bug_report),
                       const SizedBox(width: 8),
                       Text(
-                        'WS デバッグログ (${entries.length})',
+                        'デバッグログ (${entries.length})',
                         style: Theme.of(context).textTheme.titleMedium,
                       ),
                       const Spacer(),
@@ -681,7 +687,7 @@ class _DebugLogSheet extends StatelessWidget {
                         onPressed: entries.isEmpty
                             ? null
                             : () async {
-                                final text = entries.reversed.join('\n');
+                                final text = entries.join('\n');
                                 await Clipboard.setData(
                                   ClipboardData(text: text),
                                 );
