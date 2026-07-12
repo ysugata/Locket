@@ -244,13 +244,40 @@ class AppController extends ChangeNotifier {
     final prev = _prevBleState;
     _prevBleState = state;
     if (!_running) return;
+
+    // Crash-loop guard: reading a wedged, full SD card can crash the
+    // device (watchdog reset → BLE drop). Count disconnects that
+    // happen mid-sync; after 2, stop auto-syncing on reconnect so the
+    // relay doesn't cycle connect→sync→crash forever. Manual sync or
+    // rescue resets the counter.
+    if (state == OmiConnectionState.disconnected &&
+        prev == OmiConnectionState.connected &&
+        (_sdCardSync?.isSyncing.value ?? false)) {
+      _syncDisconnectCount++;
+      debugPrint(
+        '[App] BLE dropped mid-sync ($_syncDisconnectCount) — '
+        '${_syncDisconnectCount >= 2 ? "auto-sync disabled" : "will retry once"}',
+      );
+    }
+
     if (state == OmiConnectionState.connected &&
         prev != OmiConnectionState.connected) {
-      debugPrint('[App] BLE reconnected — resuming SD sync + WAL upload');
+      debugPrint('[App] BLE reconnected — resuming WAL upload');
       _walStore?.uploadPending();
-      _autoSyncSDCard(); // syncAll() is a no-op while already syncing
+      if (_syncDisconnectCount >= 2) {
+        debugPrint(
+          '[App] auto-sync suppressed after repeated mid-sync disconnects',
+        );
+        _sdCardSync?.lastError.value =
+            '同期中にデバイスが2回切断されたため自動同期を停止しました。'
+            '設定の「レスキュー同期」をお試しください';
+      } else {
+        _autoSyncSDCard(); // syncAll() is a no-op while already syncing
+      }
     }
   }
+
+  int _syncDisconnectCount = 0;
 
   void _scheduleStartRetry() {
     _startRetryTimer?.cancel();
@@ -313,6 +340,7 @@ class AppController extends ChangeNotifier {
   Future<void> syncSDCard() async {
     final sync = _sdCardSync;
     if (sync == null) return;
+    _syncDisconnectCount = 0; // manual action re-arms auto-sync
     await sync.syncAll();
   }
 
@@ -322,6 +350,7 @@ class AppController extends ChangeNotifier {
   Future<void> rescueSDCard() async {
     final sync = _sdCardSync;
     if (sync == null) return;
+    _syncDisconnectCount = 0; // manual action re-arms auto-sync
     await sync.rescueSync();
   }
 

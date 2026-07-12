@@ -304,6 +304,37 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
     final deviceId = widget.app.settings.pairedBleId;
     if (deviceId == null) return;
 
+    // Updating wipes the device's SD storage, and 3.0.20+ speaks the
+    // new ring protocol this app doesn't support yet — make both
+    // consequences explicit before flashing.
+    final targetVersion = fw.latestInfo?.version ?? '';
+    final isRingFirmware = _versionAtLeast(targetVersion, '3.0.20');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('ファームウェア更新'),
+        content: Text(
+          '更新するとデバイスのSDストレージは消去されます。'
+          '未同期の録音（SDに残っているもの）はすべて失われます。\n'
+          '${isRingFirmware ? '\n⚠ $targetVersion は新しいリング方式の'
+                    'ストレージプロトコルです。Locket が対応するまで '
+                    'SD同期は動作しません（ライブ文字起こしは影響ありません）。\n' : ''}'
+          '\n続行しますか？',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('更新する'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
     // Disable auto-reconnect during DFU — disconnect is expected.
     widget.app.device.enableAutoReconnect(false);
 
@@ -313,6 +344,19 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
       hasSmpService: widget.app.device.hasSmpService.value,
     );
     if (mounted) setState(() {});
+  }
+
+  /// Compare dotted versions: true when [v] >= [min].
+  static bool _versionAtLeast(String v, String min) {
+    List<int> parse(String s) =>
+        s.split('.').map((p) => int.tryParse(p) ?? 0).toList();
+    final a = parse(v);
+    final b = parse(min);
+    for (var i = 0; i < b.length; i++) {
+      final ai = i < a.length ? a[i] : 0;
+      if (ai != b[i]) return ai > b[i];
+    }
+    return true;
   }
 
   @override

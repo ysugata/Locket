@@ -129,7 +129,9 @@ class FirmwareService extends ChangeNotifier {
     }
   }
 
-  /// Download the OTA zip to temp directory.
+  /// Download the OTA zip to temp directory. Retries transient
+  /// failures and reports detailed errors (the GitHub asset URL
+  /// redirects once to objects.githubusercontent.com — verified OK).
   Future<String?> download(FirmwareInfo info) async {
     isDownloading.value = true;
     downloadProgress.value = 0;
@@ -137,48 +139,79 @@ class FirmwareService extends ChangeNotifier {
     downloadedZipPath = null;
     notifyListeners();
 
+    final client = http.Client();
     try {
-      final request = http.Request('GET', Uri.parse(info.downloadUrl));
-      final streamedResponse = await request.send().timeout(
-        const Duration(seconds: 30),
-      );
+      for (var attempt = 1; attempt <= 3; attempt++) {
+        try {
+          debugPrint('[FW] download attempt $attempt: ${info.downloadUrl}');
+          final request = http.Request('GET', Uri.parse(info.downloadUrl));
+          final streamedResponse = await client
+              .send(request)
+              .timeout(const Duration(seconds: 30));
 
-      if (streamedResponse.statusCode != 200) {
-        error.value = 'ダウンロードエラー: HTTP ${streamedResponse.statusCode}';
-        return null;
-      }
+          if (streamedResponse.statusCode != 200) {
+            error.value =
+                'ダウンロードエラー: HTTP ${streamedResponse.statusCode} '
+                '${streamedResponse.reasonPhrase ?? ''}';
+            debugPrint('[FW] ${error.value}');
+            if (streamedResponse.statusCode >= 400 &&
+                streamedResponse.statusCode < 500) {
+              return null; // permanent
+            }
+            continue; // retry 5xx
+          }
 
-      final totalBytes = streamedResponse.contentLength ?? info.size;
-      final tempDir = await getTemporaryDirectory();
-      final zipFile = File('${tempDir.path}/firmware.zip');
+          final totalBytes = streamedResponse.contentLength ?? info.size;
+          final tempDir = await getTemporaryDirectory();
+          final zipFile = File('${tempDir.path}/firmware.zip');
 
-      int receivedBytes = 0;
-      final sink = zipFile.openWrite();
+          int receivedBytes = 0;
+          final sink = zipFile.openWrite();
 
-      try {
-        await for (final chunk in streamedResponse.stream) {
-          sink.add(chunk);
-          receivedBytes += chunk.length;
-          if (totalBytes > 0) {
-            downloadProgress.value = ((receivedBytes / totalBytes) * 100)
-                .round()
-                .clamp(0, 100);
-            notifyListeners();
+          try {
+            // Per-chunk inactivity timeout so a stalled connection
+            // fails visibly instead of hanging forever.
+            await for (final chunk in streamedResponse.stream.timeout(
+              const Duration(seconds: 30),
+            )) {
+              sink.add(chunk);
+              receivedBytes += chunk.length;
+              if (totalBytes > 0) {
+                downloadProgress.value = ((receivedBytes / totalBytes) * 100)
+                    .round()
+                    .clamp(0, 100);
+                notifyListeners();
+              }
+            }
+          } finally {
+            await sink.close();
+          }
+
+          if (totalBytes > 0 && receivedBytes < totalBytes) {
+            error.value =
+                'ダウンロードが途中で切断されました '
+                '($receivedBytes/$totalBytes B)';
+            debugPrint('[FW] ${error.value}');
+            continue; // retry
+          }
+
+          downloadProgress.value = 100;
+          downloadedZipPath = zipFile.path;
+          error.value = null;
+          notifyListeners();
+          debugPrint('[FW] Downloaded ${zipFile.path} ($receivedBytes bytes)');
+          return zipFile.path;
+        } catch (e) {
+          error.value = 'ダウンロードエラー: $e';
+          debugPrint('[FW] download attempt $attempt failed: $e');
+          if (attempt < 3) {
+            await Future<void>.delayed(const Duration(seconds: 2));
           }
         }
-      } finally {
-        await sink.close();
       }
-
-      downloadProgress.value = 100;
-      downloadedZipPath = zipFile.path;
-      notifyListeners();
-      debugPrint('[FW] Downloaded ${zipFile.path} ($receivedBytes bytes)');
-      return zipFile.path;
-    } catch (e) {
-      error.value = 'ダウンロードエラー: $e';
       return null;
     } finally {
+      client.close();
       isDownloading.value = false;
       notifyListeners();
     }
