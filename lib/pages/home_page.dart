@@ -456,6 +456,20 @@ class _SDSyncCard extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             LinearProgressIndicator(value: progress),
+            if (sync.currentActivity.value != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                sync.currentActivity.value!,
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 4),
+              LinearProgressIndicator(
+                value: sync.activityProgress.value,
+                minHeight: 3,
+              ),
+            ],
             if (transferred > 0) ...[
               const SizedBox(height: 4),
               Text(

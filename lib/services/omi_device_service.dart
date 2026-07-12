@@ -487,11 +487,13 @@ class OmiDeviceService extends ChangeNotifier {
   }
 
   /// Send CMD_DELETE_FILE (0x12, fileIndex) — new multi-file protocol.
-  /// Waits for a single-byte response (0x00 = success). On a wedged,
-  /// nearly-full LittleFS a delete can take a very long time (metadata
-  /// rewrite triggers full-filesystem scans), so [timeout] is
-  /// configurable — the rescue path uses 60s.
-  Future<bool> deleteStorageFile(
+  /// Returns the device's single-byte response code (0x00 = success;
+  /// other values are firmware errors, e.g. busy worker / index out of
+  /// range), or null on timeout. On a wedged, nearly-full LittleFS a
+  /// delete can take a very long time (metadata rewrite triggers
+  /// full-filesystem scans), so [timeout] is configurable — the rescue
+  /// path uses 90s.
+  Future<int?> deleteStorageFile(
     int fileIndex, {
     Duration timeout = const Duration(seconds: 5),
   }) async {
@@ -500,7 +502,7 @@ class OmiDeviceService extends ChangeNotifier {
       throw StateError('Storage data characteristic not available');
     }
 
-    final completer = Completer<bool>();
+    final completer = Completer<int?>();
     StreamSubscription<List<int>>? sub;
     Timer? timeoutTimer;
 
@@ -508,7 +510,7 @@ class OmiDeviceService extends ChangeNotifier {
       if (value.length == 1) {
         sub?.cancel();
         timeoutTimer?.cancel();
-        if (!completer.isCompleted) completer.complete(value[0] == 0x00);
+        if (!completer.isCompleted) completer.complete(value[0]);
       }
     });
 
@@ -516,7 +518,7 @@ class OmiDeviceService extends ChangeNotifier {
       sub?.cancel();
       if (!completer.isCompleted) {
         debugPrint('[BLE] CMD_DELETE_FILE timeout for index $fileIndex');
-        completer.complete(false);
+        completer.complete(null);
       }
     });
 
