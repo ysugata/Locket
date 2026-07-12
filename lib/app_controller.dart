@@ -254,6 +254,12 @@ class AppController extends ChangeNotifier {
         prev == OmiConnectionState.connected &&
         (_sdCardSync?.isSyncing.value ?? false)) {
       _syncDisconnectCount++;
+      // A rescue interrupted by a device crash (probe reads can trip
+      // the firmware watchdog) should continue where it left off so an
+      // unattended overnight run survives.
+      if (_sdCardSync?.isRescue.value ?? false) {
+        _resumeRescueOnReconnect = true;
+      }
       debugPrint(
         '[App] BLE dropped mid-sync ($_syncDisconnectCount) — '
         '${_syncDisconnectCount >= 2 ? "auto-sync disabled" : "will retry once"}',
@@ -264,7 +270,13 @@ class AppController extends ChangeNotifier {
         prev != OmiConnectionState.connected) {
       debugPrint('[App] BLE reconnected — resuming WAL upload');
       _walStore?.uploadPending();
-      if (_syncDisconnectCount >= 2) {
+      if (_resumeRescueOnReconnect) {
+        _resumeRescueOnReconnect = false;
+        debugPrint('[App] resuming interrupted RESCUE sync');
+        Future<void>.delayed(const Duration(seconds: 3), () {
+          if (_running) _sdCardSync?.rescueSync();
+        });
+      } else if (_syncDisconnectCount >= 2) {
         debugPrint(
           '[App] auto-sync suppressed after repeated mid-sync disconnects',
         );
@@ -278,6 +290,7 @@ class AppController extends ChangeNotifier {
   }
 
   int _syncDisconnectCount = 0;
+  bool _resumeRescueOnReconnect = false;
 
   void _scheduleStartRetry() {
     _startRetryTimer?.cancel();
