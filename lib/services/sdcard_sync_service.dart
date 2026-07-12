@@ -77,65 +77,121 @@ class SDCardSyncService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// One CMD_DELETE with a 90s cap, ticking the activity gauge every
-  /// second so the user can see the device is being waited on.
-  Future<int?> _patientDelete(int index, {required String label}) async {
-    const timeout = Duration(seconds: 90);
-    final start = DateTime.now();
-    _activityTicker?.cancel();
-    _activityTicker = Timer.periodic(const Duration(seconds: 1), (_) {
-      final s = DateTime.now().difference(start).inSeconds;
-      _setActivity(
-        '$label — 応答待ち ${s}s / 最大90s',
-        fraction: (s / 90).clamp(0.0, 1.0),
-      );
-    });
-    _setActivity('$label — 応答待ち 0s / 最大90s', fraction: 0);
-    try {
-      return await device.deleteStorageFile(index, timeout: timeout);
-    } finally {
-      _activityTicker?.cancel();
-      _activityTicker = null;
-    }
-  }
+  /// Rescue phase 1 — fire-and-verify space freeing, no reads at all.
+  ///
+  /// Field evidence (builds 10-11): the firmware's delete RESPONSE is
+  /// worthless — every failure maps to code 0x7 and arrives in ~30ms —
+  /// yet deletes DO land on disk later (observed file count 106→105).
+  /// So: send CMD_DELETE(0), ignore the response, and verify by
+  /// polling the storage stats (served from the firmware's RAM cache,
+  /// safe to read) until the file count or total-byte figure drops.
+  ///
+  /// The first index-0 entries are usually 0-byte boot files (created
+  /// with an unset RTC → tiny hex timestamp → sorted first); deleting
+  /// them frees no space, so success is counted in REAL bytes freed.
+  Future<bool> _rescueFreeSpace(int targetRealFrees, int maxSacrifice) async {
+    final deadline = DateTime.now().add(const Duration(minutes: 25));
+    const verifyWindow = Duration(minutes: 5);
 
-  /// Rescue phase 1: free space WITHOUT issuing a single read. The SD
-  /// worker is typically wedged for minutes right after connect (the
-  /// firmware queues a buffer flush against the full filesystem), and
-  /// an instant error response just means "worker busy" — so retry
-  /// deletes with 30s waits for up to ~15 minutes. Reads are poison
-  /// here: each one re-wedges the worker for minutes.
-  Future<bool> _rescueFreeSpace(int targetFrees, int maxSacrifice) async {
-    final deadline = DateTime.now().add(const Duration(minutes: 15));
-    var attempt = 0;
-    while (sacrificedFiles.value < targetFrees &&
-        sacrificedFiles.value < maxSacrifice &&
+    var stats = await device.getStorageList();
+    if (stats.length < 2) {
+      _log('RESCUE: stats unavailable');
+      return false;
+    }
+    var baselineBytes = stats[0];
+    var baselineCount = stats[1];
+    var realFreed = 0;
+    var emptyFreed = 0;
+    var round = 0;
+
+    while (realFreed < targetRealFrees &&
+        realFreed < maxSacrifice &&
+        emptyFreed < 12 &&
         !_cancelled &&
         DateTime.now().isBefore(deadline)) {
-      attempt++;
-      _log('RESCUE free-space: delete file[0] attempt $attempt');
-      final code = await _patientDelete(
-        0,
-        label:
-            '空き容量を確保: 最古ファイルを削除 (試行$attempt回目, '
-            '確保済み ${sacrificedFiles.value}件)',
+      round++;
+      _log(
+        'RESCUE round $round: fire CMD_DELETE(0) '
+        '[count=$baselineCount bytes=$baselineBytes]',
       );
-      if (_cancelled) break;
-      if (code == 0x00) {
-        sacrificedFiles.value = sacrificedFiles.value + 1;
-        _log('RESCUE free-space: delete OK (${sacrificedFiles.value} freed)');
-        await Future<void>.delayed(const Duration(seconds: 2));
-      } else {
-        final reason = code == null
-            ? 'timeout(90s)'
-            : 'code 0x${code.toRadixString(16)}';
-        _log('RESCUE free-space: delete failed ($reason) — waiting 30s');
-        _setActivity('SDワーカーの解放待ち（30秒後に再試行、試行$attempt回目）...');
-        await Future<void>.delayed(const Duration(seconds: 30));
+      _setActivity('削除要求を送信中 (ラウンド$round)...');
+      try {
+        // Response is informational only — log it, trust the stats.
+        final code = await device.deleteStorageFile(
+          0,
+          timeout: const Duration(seconds: 10),
+        );
+        _log(
+          'RESCUE round $round: response '
+          '${code == null ? "timeout" : "0x${code.toRadixString(16)}"} '
+          '(ignored — verifying via stats)',
+        );
+      } catch (e) {
+        _log('RESCUE round $round: delete write failed: $e');
       }
+
+      // Poll stats until the deletion becomes visible. The wedged SD
+      // worker executes queued work slowly (full-filesystem scans take
+      // 10-50s each), so give it up to 5 minutes per round.
+      var confirmed = false;
+      final verifyStart = DateTime.now();
+      while (!confirmed &&
+          !_cancelled &&
+          DateTime.now().difference(verifyStart) < verifyWindow) {
+        for (var i = 0; i < 15 && !_cancelled; i++) {
+          final s = DateTime.now().difference(verifyStart).inSeconds;
+          _setActivity(
+            '削除の反映を確認中 (ラウンド$round) — ${s}s / 最大300s '
+            '[実データ解放 $realFreed件, 空ファイル $emptyFreed件]',
+            fraction: (s / 300).clamp(0.0, 1.0),
+          );
+          await Future<void>.delayed(const Duration(seconds: 1));
+        }
+        if (_cancelled) break;
+        try {
+          stats = await device.getStorageList();
+        } catch (e) {
+          _log('RESCUE: stats read failed: $e');
+          continue;
+        }
+        if (stats.length < 2) continue;
+        final bytes = stats[0];
+        final count = stats[1];
+        if (count < baselineCount || bytes < baselineBytes) {
+          confirmed = true;
+          final freedBytes = baselineBytes - bytes;
+          if (freedBytes > 0) {
+            realFreed++;
+            sacrificedFiles.value = realFreed;
+            _log(
+              'RESCUE round $round: CONFIRMED — ${freedBytes}B freed '
+              '(count $baselineCount→$count)',
+            );
+          } else {
+            emptyFreed++;
+            _log(
+              'RESCUE round $round: CONFIRMED — empty file removed '
+              '(count $baselineCount→$count, no bytes freed)',
+            );
+          }
+          baselineBytes = bytes;
+          baselineCount = count;
+          totalBytesOnCard = bytes;
+          notifyListeners();
+        }
+      }
+      if (!confirmed) {
+        _log('RESCUE round $round: no change after 5min — firing again');
+      }
+      await Future<void>.delayed(const Duration(seconds: 2));
     }
+
     _setActivity(null);
-    return sacrificedFiles.value > 0;
+    _log(
+      'RESCUE phase 1 result: realFreed=$realFreed emptyFreed=$emptyFreed '
+      'rounds=$round',
+    );
+    return realFreed > 0;
   }
 
   /// Recent sync events, shown in the in-app debug sheet so failures
@@ -325,20 +381,20 @@ class SDCardSyncService extends ChangeNotifier {
     // firmware fast-fails new requests. Reads also crash the device
     // outright sometimes. So: no reads at all until deletes succeed.
     if (rescue && maxSacrifice > 0) {
-      _log('RESCUE phase 1: patient free-space (no reads)');
+      _log('RESCUE phase 1: fire-and-verify free-space (no reads)');
       final anyFreed = await _rescueFreeSpace(2, maxSacrifice);
       if (_cancelled) return;
       if (!anyFreed) {
         lastError.value =
-            '空き容量を確保できませんでした（15分間、削除が一度も通りません'
-            'でした）。デバイスの電源を入れ直してもう一度レスキューを試すか、'
-            'ファーム更新（SD全消去）をご検討ください';
-        _log('RESCUE phase 1 failed — no deletes succeeded in 15min');
+            '実データの空き容量を確保できませんでした（削除は送れても'
+            '容量が減りません）。デバイスの電源を入れ直してもう一度'
+            'レスキューを試すか、ファーム更新（SD全消去）をご検討ください';
+        _log('RESCUE phase 1 failed — no real bytes freed');
         return;
       }
       _log(
-        'RESCUE phase 1 done: ${sacrificedFiles.value} freed — '
-        'starting drain',
+        'RESCUE phase 1 done: ${sacrificedFiles.value} real file(s) freed '
+        '— starting drain',
       );
     }
 
@@ -432,34 +488,38 @@ class SDCardSyncService extends ChangeNotifier {
               _log('sacrifice budget exhausted — aborting rescue');
               break;
             }
+            // Fire-and-verify (the response code is unreliable): send
+            // the delete, give the wedged worker a real pause, and let
+            // the stats re-check below detect whether it landed.
             _log(
               'RESCUE: sacrificing unreadable file[$base] '
-              '(${sacrificedFiles.value + 1}/$maxSacrifice)',
+              '(${sacrificedFiles.value + 1}/$maxSacrifice, fire-and-verify)',
             );
-            final code = await _patientDelete(
-              base,
-              label:
-                  '読めないファイル[$base]を削除 '
-                  '(${sacrificedFiles.value + 1}/$maxSacrifice件目)',
-            );
-            if (code == 0x00) {
-              sacrificedFiles.value = sacrificedFiles.value + 1;
-              consecutiveStalls = 0;
-              _log('RESCUE: file[$base] deleted — retrying reads');
-              await Future<void>.delayed(const Duration(seconds: 2));
-              // Count drop is detected below; base stays put and the
-              // next file slides in.
-            } else {
-              final reason = code == null
-                  ? 'timeout(90s)'
-                  : 'code 0x${code.toRadixString(16)}';
-              _log('RESCUE: delete of file[$base] failed ($reason)');
-              // The worker is busy again (probably wedged by our own
-              // read) — give it a real break before continuing.
-              _setActivity('SDワーカーの解放待ち（30秒）...');
-              await Future<void>.delayed(const Duration(seconds: 30));
-              _setActivity(null);
+            try {
+              final code = await device.deleteStorageFile(
+                base,
+                timeout: const Duration(seconds: 10),
+              );
+              _log(
+                'RESCUE: delete response '
+                '${code == null ? "timeout" : "0x${code.toRadixString(16)}"} '
+                '(ignored)',
+              );
+            } catch (e) {
+              _log('RESCUE: delete write failed: $e');
             }
+            sacrificedFiles.value = sacrificedFiles.value + 1;
+            consecutiveStalls = 0;
+            for (var i = 0; i < 45 && !_cancelled; i++) {
+              _setActivity(
+                '削除の反映待ち ${i}s / 45s (ファイル[$base])',
+                fraction: i / 45,
+              );
+              await Future<void>.delayed(const Duration(seconds: 1));
+            }
+            _setActivity(null);
+            // Count drop is detected below; base stays put when the
+            // delete landed, advances past the entry otherwise.
           }
         } else {
           consecutiveStalls = 0;
