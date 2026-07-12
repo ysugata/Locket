@@ -435,6 +435,7 @@ class SDCardSyncService extends ChangeNotifier {
     // aborted a healthy drain after 6 successful uploads).
     var drainSacrifices = 0;
     var lastStallBase = -1;
+    var skippedStallers = 0;
 
     // Rescue phase 1: free space BEFORE any read, with patience.
     // Field evidence (build 10): deletes issued right after a read
@@ -496,6 +497,7 @@ class SDCardSyncService extends ChangeNotifier {
 
       if (result.frames.isNotEmpty) {
         consecutiveStalls = 0;
+        skippedStallers = 0;
         final ts = _resolveTimestampStart(0, result.epochSeconds);
         final ok = await _uploadFrames(result.frames, timestampStart: ts);
         if (ok) {
@@ -556,48 +558,56 @@ class SDCardSyncService extends ChangeNotifier {
               _setActivity(null);
               continue; // retry same base (stats re-read at loop top)
             }
-            // Second stall on the same file: sacrifice it. NOTE: this
-            // budget is separate from phase 1's confirmed deletions —
-            // phase 1 clears mostly-empty boot files, whereas this
-            // deletes a potentially real file that will not stream.
-            if (drainSacrifices >= maxSacrifice) {
-              lastError.value =
-                  'ドレイン中に $maxSacrifice 件削除しても読み出しが安定しません。'
-                  'もう一度レスキューを実行すると続きから再開できます';
-              _log('drain sacrifice budget exhausted — stopping');
-              break;
-            }
-            drainSacrifices++;
-            _log(
-              'RESCUE: sacrificing unreadable file[$base] '
-              '(drain sacrifice $drainSacrifices/$maxSacrifice)',
-            );
-            try {
-              final code = await device.deleteStorageFile(
-                base,
-                timeout: const Duration(seconds: 10),
-              );
-              _log(
-                'RESCUE: delete response '
-                '${code == null ? "timeout" : "0x${code.toRadixString(16)}"} '
-                '(ignored)',
-              );
-            } catch (e) {
-              _log('RESCUE: delete write failed: $e');
-            }
-            sacrificedFiles.value = sacrificedFiles.value + 1;
+            // Second stall on the same file: this entry is unreadable
+            // (2 read attempts + in-read resume all yielded nothing).
+            // Now that space is freed, deleting it rescues nothing —
+            // SKIP it and keep draining. Field data (build 14) showed
+            // dead entries interleaved with good files, and a
+            // 5-sacrifice budget forced manual restarts every few
+            // files. Only when several distinct files stall in a row
+            // (suggesting a re-wedge rather than dead entries) is one
+            // sacrifice spent to relieve filesystem pressure.
             consecutiveStalls = 0;
             lastStallBase = -1;
-            for (var i = 0; i < 45 && !_cancelled; i++) {
-              _setActivity(
-                '削除の反映待ち ${i}s / 45s (ファイル[$base])',
-                fraction: i / 45,
+            skippedStallers++;
+            if (skippedStallers % 3 == 0 && drainSacrifices < maxSacrifice) {
+              drainSacrifices++;
+              _log(
+                'RESCUE: 3 consecutive dead entries — sacrificing '
+                'file[$base] to relieve pressure '
+                '($drainSacrifices/$maxSacrifice)',
               );
-              await Future<void>.delayed(const Duration(seconds: 1));
+              try {
+                final code = await device.deleteStorageFile(
+                  base,
+                  timeout: const Duration(seconds: 10),
+                );
+                _log(
+                  'RESCUE: delete response '
+                  '${code == null ? "timeout" : "0x${code.toRadixString(16)}"} '
+                  '(ignored)',
+                );
+              } catch (e) {
+                _log('RESCUE: delete write failed: $e');
+              }
+              sacrificedFiles.value = sacrificedFiles.value + 1;
+              for (var i = 0; i < 45 && !_cancelled; i++) {
+                _setActivity(
+                  '削除の反映待ち ${i}s / 45s (ファイル[$base])',
+                  fraction: i / 45,
+                );
+                await Future<void>.delayed(const Duration(seconds: 1));
+              }
+              _setActivity(null);
+              // Count drop detected below decides base advancement.
+            } else {
+              _log(
+                'RESCUE: file[$base] unreadable — skipping '
+                '(kept on device, $skippedStallers skipped so far)',
+              );
+              // No delete: the advance rule below sees an unchanged
+              // count and moves past this entry.
             }
-            _setActivity(null);
-            // Count drop is detected below; base stays put when the
-            // delete landed, advances past the entry otherwise.
           }
         } else {
           consecutiveStalls = 0;
