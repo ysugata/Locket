@@ -235,6 +235,30 @@ class SDCardSyncService extends ChangeNotifier {
     var processed = 0;
     var consecutiveStalls = 0;
 
+    // Rescue: sacrifice BEFORE the first read. Field evidence shows a
+    // read against the wedged, full card can crash the device (BLE
+    // drops ~11s after CMD_READ_FILE — likely a firmware watchdog
+    // reset), so the freeing delete must come first, not in reaction
+    // to a failed read.
+    if (rescue && maxSacrifice > 0) {
+      _log('RESCUE: freeing space before first read (delete file[0])');
+      try {
+        final deleted = await device.deleteStorageFile(
+          0,
+          timeout: const Duration(seconds: 60),
+        );
+        if (deleted) {
+          sacrificedFiles.value = sacrificedFiles.value + 1;
+          _log('RESCUE: initial delete OK');
+        } else {
+          _log('RESCUE: initial delete failed/timed out — probing anyway');
+        }
+      } catch (e) {
+        _log('RESCUE: initial delete error: $e');
+      }
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+
     while (processed < fileCountFromStats && !_cancelled) {
       // Re-read stats each round: the firmware re-indexes after its
       // auto-delete, and the count tells us whether [base] advanced.
