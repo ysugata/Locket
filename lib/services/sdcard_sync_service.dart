@@ -61,6 +61,83 @@ class SDCardSyncService extends ChangeNotifier {
   final ValueNotifier<int> transferredBytes = ValueNotifier(0);
   int totalBytesOnCard = 0;
 
+  /// Human-readable line describing what the sync is doing RIGHT NOW
+  /// ("削除 応答待ち 42s / 最大90s" etc.), shown on the sync card so a
+  /// long-running operation never looks frozen.
+  final ValueNotifier<String?> currentActivity = ValueNotifier(null);
+
+  /// 0..1 gauge for the current timed activity (null = hidden).
+  final ValueNotifier<double?> activityProgress = ValueNotifier(null);
+
+  Timer? _activityTicker;
+
+  void _setActivity(String? text, {double? fraction}) {
+    currentActivity.value = text;
+    activityProgress.value = fraction;
+    notifyListeners();
+  }
+
+  /// One CMD_DELETE with a 90s cap, ticking the activity gauge every
+  /// second so the user can see the device is being waited on.
+  Future<int?> _patientDelete(int index, {required String label}) async {
+    const timeout = Duration(seconds: 90);
+    final start = DateTime.now();
+    _activityTicker?.cancel();
+    _activityTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      final s = DateTime.now().difference(start).inSeconds;
+      _setActivity(
+        '$label — 応答待ち ${s}s / 最大90s',
+        fraction: (s / 90).clamp(0.0, 1.0),
+      );
+    });
+    _setActivity('$label — 応答待ち 0s / 最大90s', fraction: 0);
+    try {
+      return await device.deleteStorageFile(index, timeout: timeout);
+    } finally {
+      _activityTicker?.cancel();
+      _activityTicker = null;
+    }
+  }
+
+  /// Rescue phase 1: free space WITHOUT issuing a single read. The SD
+  /// worker is typically wedged for minutes right after connect (the
+  /// firmware queues a buffer flush against the full filesystem), and
+  /// an instant error response just means "worker busy" — so retry
+  /// deletes with 30s waits for up to ~15 minutes. Reads are poison
+  /// here: each one re-wedges the worker for minutes.
+  Future<bool> _rescueFreeSpace(int targetFrees, int maxSacrifice) async {
+    final deadline = DateTime.now().add(const Duration(minutes: 15));
+    var attempt = 0;
+    while (sacrificedFiles.value < targetFrees &&
+        sacrificedFiles.value < maxSacrifice &&
+        !_cancelled &&
+        DateTime.now().isBefore(deadline)) {
+      attempt++;
+      _log('RESCUE free-space: delete file[0] attempt $attempt');
+      final code = await _patientDelete(
+        0,
+        label:
+            '空き容量を確保: 最古ファイルを削除 (試行$attempt回目, '
+            '確保済み ${sacrificedFiles.value}件)',
+      );
+      if (_cancelled) break;
+      if (code == 0x00) {
+        sacrificedFiles.value = sacrificedFiles.value + 1;
+        _log('RESCUE free-space: delete OK (${sacrificedFiles.value} freed)');
+        await Future<void>.delayed(const Duration(seconds: 2));
+      } else {
+        final reason = code == null
+            ? 'timeout(90s)'
+            : 'code 0x${code.toRadixString(16)}';
+        _log('RESCUE free-space: delete failed ($reason) — waiting 30s');
+        _setActivity('SDワーカーの解放待ち（30秒後に再試行、試行$attempt回目）...');
+        await Future<void>.delayed(const Duration(seconds: 30));
+      }
+    }
+    _setActivity(null);
+    return sacrificedFiles.value > 0;
+  }
+
   /// Recent sync events, shown in the in-app debug sheet so failures
   /// can be diagnosed from TestFlight builds without a tethered device.
   final ValueNotifier<List<String>> debugLog = ValueNotifier<List<String>>(
@@ -100,6 +177,8 @@ class SDCardSyncService extends ChangeNotifier {
     }
     _storageSub?.cancel();
     _storageSub = null;
+    _activityTicker?.cancel();
+    _activityTicker = null;
   }
 
   /// True while a rescue sync (audio paused, sacrificial deletes
@@ -194,6 +273,10 @@ class SDCardSyncService extends ChangeNotifier {
           _log('audio resume failed: $e');
         }
       }
+      _activityTicker?.cancel();
+      _activityTicker = null;
+      currentActivity.value = null;
+      activityProgress.value = null;
       isSyncing.value = false;
       isRescue.value = false;
       notifyListeners();
@@ -235,28 +318,28 @@ class SDCardSyncService extends ChangeNotifier {
     var processed = 0;
     var consecutiveStalls = 0;
 
-    // Rescue: sacrifice BEFORE the first read. Field evidence shows a
-    // read against the wedged, full card can crash the device (BLE
-    // drops ~11s after CMD_READ_FILE — likely a firmware watchdog
-    // reset), so the freeing delete must come first, not in reaction
-    // to a failed read.
+    // Rescue phase 1: free space BEFORE any read, with patience.
+    // Field evidence (build 10): deletes issued right after a read
+    // fail in ~30ms — the SD worker is busy for minutes (connect-time
+    // flush / a previous read wedged in full-LittleFS scans) and the
+    // firmware fast-fails new requests. Reads also crash the device
+    // outright sometimes. So: no reads at all until deletes succeed.
     if (rescue && maxSacrifice > 0) {
-      _log('RESCUE: freeing space before first read (delete file[0])');
-      try {
-        final deleted = await device.deleteStorageFile(
-          0,
-          timeout: const Duration(seconds: 60),
-        );
-        if (deleted) {
-          sacrificedFiles.value = sacrificedFiles.value + 1;
-          _log('RESCUE: initial delete OK');
-        } else {
-          _log('RESCUE: initial delete failed/timed out — probing anyway');
-        }
-      } catch (e) {
-        _log('RESCUE: initial delete error: $e');
+      _log('RESCUE phase 1: patient free-space (no reads)');
+      final anyFreed = await _rescueFreeSpace(2, maxSacrifice);
+      if (_cancelled) return;
+      if (!anyFreed) {
+        lastError.value =
+            '空き容量を確保できませんでした（15分間、削除が一度も通りません'
+            'でした）。デバイスの電源を入れ直してもう一度レスキューを試すか、'
+            'ファーム更新（SD全消去）をご検討ください';
+        _log('RESCUE phase 1 failed — no deletes succeeded in 15min');
+        return;
       }
-      await Future<void>.delayed(const Duration(seconds: 2));
+      _log(
+        'RESCUE phase 1 done: ${sacrificedFiles.value} freed — '
+        'starting drain',
+      );
     }
 
     while (processed < fileCountFromStats && !_cancelled) {
@@ -275,6 +358,7 @@ class SDCardSyncService extends ChangeNotifier {
       }
 
       _log('Reading file[$base] (count=$countBefore)');
+      _setActivity('ファイル[$base] を読み出し中... (残り $countBefore 件)');
       final result = await _readFileWithResume(
         base,
         expectedSize: 0,
@@ -350,13 +434,15 @@ class SDCardSyncService extends ChangeNotifier {
             }
             _log(
               'RESCUE: sacrificing unreadable file[$base] '
-              '(${sacrificedFiles.value + 1}/$maxSacrifice, 60s timeout)',
+              '(${sacrificedFiles.value + 1}/$maxSacrifice)',
             );
-            final deleted = await device.deleteStorageFile(
+            final code = await _patientDelete(
               base,
-              timeout: const Duration(seconds: 60),
+              label:
+                  '読めないファイル[$base]を削除 '
+                  '(${sacrificedFiles.value + 1}/$maxSacrifice件目)',
             );
-            if (deleted) {
+            if (code == 0x00) {
               sacrificedFiles.value = sacrificedFiles.value + 1;
               consecutiveStalls = 0;
               _log('RESCUE: file[$base] deleted — retrying reads');
@@ -364,9 +450,15 @@ class SDCardSyncService extends ChangeNotifier {
               // Count drop is detected below; base stays put and the
               // next file slides in.
             } else {
-              _log('RESCUE: delete of file[$base] failed/timed out');
-              // Give the worker a breather before the next attempt.
-              await Future<void>.delayed(const Duration(seconds: 5));
+              final reason = code == null
+                  ? 'timeout(90s)'
+                  : 'code 0x${code.toRadixString(16)}';
+              _log('RESCUE: delete of file[$base] failed ($reason)');
+              // The worker is busy again (probably wedged by our own
+              // read) — give it a real break before continuing.
+              _setActivity('SDワーカーの解放待ち（30秒）...');
+              await Future<void>.delayed(const Duration(seconds: 30));
+              _setActivity(null);
             }
           }
         } else {
@@ -839,6 +931,9 @@ class SDCardSyncService extends ChangeNotifier {
     lastError.dispose();
     transferredBytes.dispose();
     isRescue.dispose();
+    currentActivity.dispose();
+    activityProgress.dispose();
+    _activityTicker?.cancel();
     sacrificedFiles.dispose();
     debugLog.dispose();
     super.dispose();
