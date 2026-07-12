@@ -142,9 +142,19 @@ class SDCardSyncService extends ChangeNotifier {
               'RESCUE: PROBE SUCCESS — ${probe.frames.length} frames '
               'flowed, reads recovered',
             );
-            // Stop the probe stream cleanly; the drain loop re-reads
-            // this file from offset 0 (probe frames are discarded, so
-            // nothing is uploaded twice).
+            // The firmware auto-deletes a fully-streamed file, so the
+            // probe data may be the ONLY copy — secure it before
+            // anything else.
+            _setActivity('試し読みデータをアップロード中...');
+            final secured = await _uploadOrSpill(
+              probe.frames,
+              probe.epochSeconds,
+            );
+            if (!secured) {
+              lastError.value = '試し読みデータの保全に失敗しました。中断します';
+              _setActivity(null);
+              return false;
+            }
             try {
               await device.stopStorageSync();
             } catch (_) {}
@@ -197,6 +207,13 @@ class SDCardSyncService extends ChangeNotifier {
       final probe = await _readFile(0, expectedSize: 0);
       if (probe.frames.isNotEmpty) {
         _log('RESCUE: FINAL PROBE SUCCESS');
+        _setActivity('試し読みデータをアップロード中...');
+        final secured = await _uploadOrSpill(probe.frames, probe.epochSeconds);
+        if (!secured) {
+          lastError.value = '試し読みデータの保全に失敗しました。中断します';
+          _setActivity(null);
+          return false;
+        }
         try {
           await device.stopStorageSync();
         } catch (_) {}
@@ -211,6 +228,26 @@ class SDCardSyncService extends ChangeNotifier {
       'RESCUE phase 1 result: confirmedDeletes=$confirmedDeletes '
       'rounds=$round — reads did not recover',
     );
+    return false;
+  }
+
+  /// Upload frames, falling back to the disk WAL. The device may have
+  /// already auto-deleted the source file, so a `false` return means
+  /// the audio could be lost and the caller must stop the operation.
+  Future<bool> _uploadOrSpill(List<Uint8List> frames, int? epochSeconds) async {
+    if (frames.isEmpty) return true;
+    final ts = _resolveTimestampStart(0, epochSeconds);
+    final ok = await _uploadFrames(frames, timestampStart: ts);
+    if (ok) return true;
+    final store = walStore;
+    if (store != null) {
+      final body = encodeLengthPrefixedFrames(frames);
+      final saved = await store.writeSegment(body, ts);
+      if (saved) {
+        _log('upload failed — spilled ${frames.length} frames to disk WAL');
+        return true;
+      }
+    }
     return false;
   }
 
@@ -393,6 +430,11 @@ class SDCardSyncService extends ChangeNotifier {
     var skipped = 0;
     var processed = 0;
     var consecutiveStalls = 0;
+    // Drain-phase sacrifice budget — deliberately separate from the
+    // phase-1 confirmed-delete counter (build 13 conflated them and
+    // aborted a healthy drain after 6 successful uploads).
+    var drainSacrifices = 0;
+    var lastStallBase = -1;
 
     // Rescue phase 1: free space BEFORE any read, with patience.
     // Field evidence (build 10): deletes issued right after a read
@@ -498,23 +540,37 @@ class SDCardSyncService extends ChangeNotifier {
             break;
           }
           if (rescue) {
-            // The full LittleFS wedges the SD worker; freeing space is
-            // the only lever. Sacrifice the unreadable file itself
-            // (oldest first) with a long timeout — metadata rewrites
-            // on a full filesystem can take tens of seconds.
-            if (sacrificedFiles.value >= maxSacrifice) {
+            // First stall on this file: probably a transient worker
+            // wedge — give it a minute and retry the SAME file before
+            // sacrificing real data.
+            if (lastStallBase != base) {
+              lastStallBase = base;
+              _log('stall on file[$base] — 60s cooldown then retry');
+              for (var i = 0; i < 60 && !_cancelled; i++) {
+                _setActivity(
+                  'ワーカー回復待ち ${i}s / 60s → ファイル[$base] を再試行',
+                  fraction: i / 60,
+                );
+                await Future<void>.delayed(const Duration(seconds: 1));
+              }
+              _setActivity(null);
+              continue; // retry same base (stats re-read at loop top)
+            }
+            // Second stall on the same file: sacrifice it. NOTE: this
+            // budget is separate from phase 1's confirmed deletions —
+            // phase 1 clears mostly-empty boot files, whereas this
+            // deletes a potentially real file that will not stream.
+            if (drainSacrifices >= maxSacrifice) {
               lastError.value =
-                  'ファイルを $maxSacrifice 件削除しても読み出しが復活しません。'
-                  'ファーム更新（SDクリア）を検討してください';
-              _log('sacrifice budget exhausted — aborting rescue');
+                  'ドレイン中に $maxSacrifice 件削除しても読み出しが安定しません。'
+                  'もう一度レスキューを実行すると続きから再開できます';
+              _log('drain sacrifice budget exhausted — stopping');
               break;
             }
-            // Fire-and-verify (the response code is unreliable): send
-            // the delete, give the wedged worker a real pause, and let
-            // the stats re-check below detect whether it landed.
+            drainSacrifices++;
             _log(
               'RESCUE: sacrificing unreadable file[$base] '
-              '(${sacrificedFiles.value + 1}/$maxSacrifice, fire-and-verify)',
+              '(drain sacrifice $drainSacrifices/$maxSacrifice)',
             );
             try {
               final code = await device.deleteStorageFile(
@@ -531,6 +587,7 @@ class SDCardSyncService extends ChangeNotifier {
             }
             sacrificedFiles.value = sacrificedFiles.value + 1;
             consecutiveStalls = 0;
+            lastStallBase = -1;
             for (var i = 0; i < 45 && !_cancelled; i++) {
               _setActivity(
                 '削除の反映待ち ${i}s / 45s (ファイル[$base])',
