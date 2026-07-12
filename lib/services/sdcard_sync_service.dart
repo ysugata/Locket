@@ -77,121 +77,141 @@ class SDCardSyncService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Rescue phase 1 — fire-and-verify space freeing, no reads at all.
+  /// Rescue phase 1 — free space by confirmed deletes + probe reads.
   ///
-  /// Field evidence (builds 10-11): the firmware's delete RESPONSE is
-  /// worthless — every failure maps to code 0x7 and arrives in ~30ms —
-  /// yet deletes DO land on disk later (observed file count 106→105).
-  /// So: send CMD_DELETE(0), ignore the response, and verify by
-  /// polling the storage stats (served from the firmware's RAM cache,
-  /// safe to read) until the file count or total-byte figure drops.
+  /// Field evidence (builds 10-12):
+  /// - Delete FAILURES all map to code 0x7 and fast-fail while the SD
+  ///   worker is busy, but a SUCCESS response (0x00) is real — the
+  ///   firmware only sends it after the file was actually removed.
+  ///   Persistence pays off: build 12 got a 0x00 on round 5.
+  /// - The storage stats lag behind reality by MORE than a session
+  ///   (firmware RAM caches refresh only on reboot when the worker is
+  ///   wedged), so stats cannot be the success signal in-session.
+  /// - The first index-0 entries are 0-byte boot files (unset RTC →
+  ///   tiny hex timestamp → sorted first); several must be cleared
+  ///   before deletes reach real data.
   ///
-  /// The first index-0 entries are usually 0-byte boot files (created
-  /// with an unset RTC → tiny hex timestamp → sorted first); deleting
-  /// them frees no space, so success is counted in REAL bytes freed.
-  Future<bool> _rescueFreeSpace(int targetRealFrees, int maxSacrifice) async {
-    final deadline = DateTime.now().add(const Duration(minutes: 25));
-    const verifyWindow = Duration(minutes: 5);
+  /// Strategy: keep firing deletes and count 0x00 responses. Every
+  /// [probeEvery] confirmed deletions, try ONE probe read — if audio
+  /// flows, space/wedge has recovered and the drain can start. Stats
+  /// are logged for reference only.
+  Future<bool> _rescueFreeSpace() async {
+    final deadline = DateTime.now().add(const Duration(minutes: 90));
+    const maxConfirmedDeletes = 12;
+    const probeEvery = 3;
 
-    var stats = await device.getStorageList();
-    if (stats.length < 2) {
-      _log('RESCUE: stats unavailable');
-      return false;
-    }
-    var baselineBytes = stats[0];
-    var baselineCount = stats[1];
-    var realFreed = 0;
-    var emptyFreed = 0;
+    var confirmedDeletes = 0;
     var round = 0;
+    var nextProbeAt = probeEvery;
 
-    while (realFreed < targetRealFrees &&
-        realFreed < maxSacrifice &&
-        emptyFreed < 12 &&
+    while (confirmedDeletes < maxConfirmedDeletes &&
         !_cancelled &&
         DateTime.now().isBefore(deadline)) {
       round++;
-      _log(
-        'RESCUE round $round: fire CMD_DELETE(0) '
-        '[count=$baselineCount bytes=$baselineBytes]',
-      );
-      _setActivity('削除要求を送信中 (ラウンド$round)...');
+      _setActivity('削除要求 ラウンド$round (確定削除 $confirmedDeletes件)...');
+      int? code;
       try {
-        // Response is informational only — log it, trust the stats.
-        final code = await device.deleteStorageFile(
+        code = await device.deleteStorageFile(
           0,
-          timeout: const Duration(seconds: 10),
-        );
-        _log(
-          'RESCUE round $round: response '
-          '${code == null ? "timeout" : "0x${code.toRadixString(16)}"} '
-          '(ignored — verifying via stats)',
+          timeout: const Duration(seconds: 30),
         );
       } catch (e) {
         _log('RESCUE round $round: delete write failed: $e');
+        await Future<void>.delayed(const Duration(seconds: 10));
+        continue;
       }
+      if (_cancelled) break;
 
-      // Poll stats until the deletion becomes visible. The wedged SD
-      // worker executes queued work slowly (full-filesystem scans take
-      // 10-50s each), so give it up to 5 minutes per round.
-      var confirmed = false;
-      final verifyStart = DateTime.now();
-      while (!confirmed &&
-          !_cancelled &&
-          DateTime.now().difference(verifyStart) < verifyWindow) {
-        for (var i = 0; i < 15 && !_cancelled; i++) {
-          final s = DateTime.now().difference(verifyStart).inSeconds;
+      if (code == 0x00) {
+        confirmedDeletes++;
+        sacrificedFiles.value = confirmedDeletes;
+        _log(
+          'RESCUE round $round: delete CONFIRMED (0x0) — '
+          'total $confirmedDeletes',
+        );
+        await Future<void>.delayed(const Duration(seconds: 5));
+
+        if (confirmedDeletes >= nextProbeAt) {
+          nextProbeAt = confirmedDeletes + probeEvery;
+          _log('RESCUE: probe read after $confirmedDeletes deletes');
+          _setActivity('試し読み中（確定削除 $confirmedDeletes件後）— 最大35秒');
+          final probe = await _readFile(0, expectedSize: 0);
+          if (_cancelled) break;
+          if (probe.frames.isNotEmpty) {
+            _log(
+              'RESCUE: PROBE SUCCESS — ${probe.frames.length} frames '
+              'flowed, reads recovered',
+            );
+            // Stop the probe stream cleanly; the drain loop re-reads
+            // this file from offset 0 (probe frames are discarded, so
+            // nothing is uploaded twice).
+            try {
+              await device.stopStorageSync();
+            } catch (_) {}
+            await Future<void>.delayed(const Duration(milliseconds: 500));
+            _setActivity(null);
+            return true;
+          }
+          _log('RESCUE: probe still dry — continuing deletes');
+          // The probe may have re-wedged the worker; give it a break.
+          _setActivity('試し読み後のワーカー回復待ち（60秒）...');
+          try {
+            await device.stopStorageSync();
+          } catch (_) {}
+          await Future<void>.delayed(const Duration(seconds: 60));
+        }
+      } else if (code == null) {
+        // Timeout: the request likely queued on the busy worker —
+        // give it time to land before firing another.
+        _log('RESCUE round $round: delete response timeout — waiting 60s');
+        for (var i = 0; i < 60 && !_cancelled; i++) {
           _setActivity(
-            '削除の反映を確認中 (ラウンド$round) — ${s}s / 最大300s '
-            '[実データ解放 $realFreed件, 空ファイル $emptyFreed件]',
-            fraction: (s / 300).clamp(0.0, 1.0),
+            '削除のキュー処理待ち ${i}s / 60s (ラウンド$round, '
+            '確定削除 $confirmedDeletes件)',
+            fraction: i / 60,
           );
           await Future<void>.delayed(const Duration(seconds: 1));
         }
-        if (_cancelled) break;
+      } else {
+        // Fast-fail (0x7 etc.): worker busy — short pause, refire.
+        _log(
+          'RESCUE round $round: busy response '
+          '0x${code.toRadixString(16)} — retry in 20s',
+        );
+        for (var i = 0; i < 20 && !_cancelled; i++) {
+          _setActivity(
+            'SDワーカー多忙 — 20秒後に再試行 (ラウンド$round, '
+            '確定削除 $confirmedDeletes件)',
+            fraction: i / 20,
+          );
+          await Future<void>.delayed(const Duration(seconds: 1));
+        }
+      }
+    }
+
+    // Final probe: even without reaching the budget, reads may have
+    // recovered from the deletions that did land.
+    if (!_cancelled && confirmedDeletes > 0) {
+      _log('RESCUE: final probe read (confirmed=$confirmedDeletes)');
+      _setActivity('最終確認の試し読み中...');
+      final probe = await _readFile(0, expectedSize: 0);
+      if (probe.frames.isNotEmpty) {
+        _log('RESCUE: FINAL PROBE SUCCESS');
         try {
-          stats = await device.getStorageList();
-        } catch (e) {
-          _log('RESCUE: stats read failed: $e');
-          continue;
-        }
-        if (stats.length < 2) continue;
-        final bytes = stats[0];
-        final count = stats[1];
-        if (count < baselineCount || bytes < baselineBytes) {
-          confirmed = true;
-          final freedBytes = baselineBytes - bytes;
-          if (freedBytes > 0) {
-            realFreed++;
-            sacrificedFiles.value = realFreed;
-            _log(
-              'RESCUE round $round: CONFIRMED — ${freedBytes}B freed '
-              '(count $baselineCount→$count)',
-            );
-          } else {
-            emptyFreed++;
-            _log(
-              'RESCUE round $round: CONFIRMED — empty file removed '
-              '(count $baselineCount→$count, no bytes freed)',
-            );
-          }
-          baselineBytes = bytes;
-          baselineCount = count;
-          totalBytesOnCard = bytes;
-          notifyListeners();
-        }
+          await device.stopStorageSync();
+        } catch (_) {}
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        _setActivity(null);
+        return true;
       }
-      if (!confirmed) {
-        _log('RESCUE round $round: no change after 5min — firing again');
-      }
-      await Future<void>.delayed(const Duration(seconds: 2));
     }
 
     _setActivity(null);
     _log(
-      'RESCUE phase 1 result: realFreed=$realFreed emptyFreed=$emptyFreed '
-      'rounds=$round',
+      'RESCUE phase 1 result: confirmedDeletes=$confirmedDeletes '
+      'rounds=$round — reads did not recover',
     );
-    return realFreed > 0;
+    return false;
   }
 
   /// Recent sync events, shown in the in-app debug sheet so failures
@@ -381,20 +401,21 @@ class SDCardSyncService extends ChangeNotifier {
     // firmware fast-fails new requests. Reads also crash the device
     // outright sometimes. So: no reads at all until deletes succeed.
     if (rescue && maxSacrifice > 0) {
-      _log('RESCUE phase 1: fire-and-verify free-space (no reads)');
-      final anyFreed = await _rescueFreeSpace(2, maxSacrifice);
+      _log('RESCUE phase 1: confirmed-delete + probe strategy');
+      final readsRecovered = await _rescueFreeSpace();
       if (_cancelled) return;
-      if (!anyFreed) {
+      if (!readsRecovered) {
         lastError.value =
-            '実データの空き容量を確保できませんでした（削除は送れても'
-            '容量が減りません）。デバイスの電源を入れ直してもう一度'
-            'レスキューを試すか、ファーム更新（SD全消去）をご検討ください';
-        _log('RESCUE phase 1 failed — no real bytes freed');
+            '削除を重ねても読み出しが復活しませんでした'
+            '（確定削除 ${sacrificedFiles.value}件）。もう一度レスキューを'
+            '実行すると続きから削除が進みます。数回試してもダメな場合は'
+            'ファーム更新（SD全消去）をご検討ください';
+        _log('RESCUE phase 1 failed — reads did not recover');
         return;
       }
       _log(
-        'RESCUE phase 1 done: ${sacrificedFiles.value} real file(s) freed '
-        '— starting drain',
+        'RESCUE phase 1 done: reads recovered after '
+        '${sacrificedFiles.value} confirmed delete(s) — starting drain',
       );
     }
 
