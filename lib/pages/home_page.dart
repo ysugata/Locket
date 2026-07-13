@@ -117,9 +117,9 @@ class _StatusCard extends StatelessWidget {
     final walDiskBytes = walStore?.pendingBytes.value ?? 0;
     final walDiskSegments = walStore?.pendingSegments.value ?? 0;
     final sdSync = app.sdCardSync;
-    final sdError = (sdSync?.isSyncing.value ?? false)
-        ? null
-        : sdSync?.lastError.value;
+    final sdSyncing = sdSync?.isSyncing.value ?? false;
+    final sdError = sdSyncing ? null : sdSync?.lastError.value;
+    final sdBytes = sdSync?.totalBytesOnCard ?? -1;
 
     return Card(
       child: Padding(
@@ -174,6 +174,17 @@ class _StatusCard extends StatelessWidget {
                   '${walDiskSegments > 0 ? ' / ディスク ${_formatBytes(walDiskBytes)} ($walDiskSegmentsセグメント)' : ''}',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
+            ],
+            if (sdSync != null && !sdSyncing) ...[
+              const SizedBox(height: 4),
+              Text(
+                sdBytes < 0
+                    ? 'SDカード: 未確認'
+                    : (sdBytes < 1024 * 1024
+                          ? 'SDカード: ほぼ空 ✓（同期・レスキュー不要）'
+                          : 'SDカード: ${_formatBytes(sdBytes)} が未同期'),
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
             ],
             if (sdError != null) ...[
               const SizedBox(height: 8),

@@ -108,6 +108,16 @@ class SDCardSyncService extends ChangeNotifier {
         !_cancelled &&
         DateTime.now().isBefore(deadline)) {
       round++;
+      // Never delete down to the last file — index 0 would then be the
+      // current recording file, and the firmware happily deletes it,
+      // recreates it, and we'd chew through it forever.
+      try {
+        final s = await device.getStorageList();
+        if (s.length > 1 && s[1] <= 1) {
+          _log('RESCUE: only the recording file remains — stopping deletes');
+          break;
+        }
+      } catch (_) {}
       _setActivity('削除要求 ラウンド$round (確定削除 $confirmedDeletes件)...');
       int? code;
       try {
@@ -348,6 +358,17 @@ class SDCardSyncService extends ChangeNotifier {
 
       if (totalBytesOnCard < 100) {
         _log('No meaningful data ($totalBytesOnCard B)');
+        return;
+      }
+
+      // A rescue only makes sense against a wedged, loaded card. On a
+      // near-empty card its delete phase would pointlessly chew
+      // through the current recording file over and over.
+      if (rescue && totalBytesOnCard < 1024 * 1024) {
+        lastError.value =
+            'SDカードはほぼ空です（${totalBytesOnCard}B）。'
+            'レスキューは不要です — 通常の同期だけで十分です';
+        _log('rescue not needed: card nearly empty');
         return;
       }
 
