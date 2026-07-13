@@ -371,7 +371,13 @@ class FirmwareService extends ChangeNotifier {
 
     final images = <mcumgr.Image>[];
     for (final entry in files) {
-      final imageIndex = entry['image'] as int? ?? 0;
+      // nRF Connect SDK manifests carry the slot as "image_index" and
+      // as a STRING (e.g. "0", "1") — the official omi client parses
+      // exactly this key. Reading the wrong key sent both nRF5340
+      // cores' images as image 0, which the device rejected with
+      // "Slot image has no hash TLV".
+      final imageIndex =
+          int.tryParse('${entry['image_index'] ?? entry['image'] ?? 0}') ?? 0;
       final fileName = entry['file'] as String? ?? '';
       if (fileName.isEmpty) continue;
 
