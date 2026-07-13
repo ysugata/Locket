@@ -44,6 +44,11 @@ class FirmwareService extends ChangeNotifier {
   final ValueNotifier<int> installProgress = ValueNotifier(0);
   final ValueNotifier<String?> error = ValueNotifier(null);
 
+  /// True once an install has reported success. The UI uses this to
+  /// show a completion state and hide the install button so the same
+  /// firmware isn't flashed repeatedly.
+  final ValueNotifier<bool> installComplete = ValueNotifier(false);
+
   FirmwareInfo? latestInfo;
   String? currentVersion;
   String? downloadedZipPath;
@@ -219,27 +224,46 @@ class FirmwareService extends ChangeNotifier {
 
   /// Perform DFU update. Auto-detects MCUmgr vs Legacy DFU based on
   /// whether the device advertises the SMP service.
+  /// Whether a DFU is safe to start (no download-in-progress etc.).
+  bool get canInstall =>
+      downloadedZipPath != null &&
+      !isInstalling.value &&
+      !isDownloading.value &&
+      !installComplete.value;
+
   Future<void> performUpdate(
     String deviceId,
     String zipPath, {
     required bool hasSmpService,
   }) async {
+    if (isInstalling.value || installComplete.value) return;
     isInstalling.value = true;
     installProgress.value = 0;
     error.value = null;
     notifyListeners();
 
+    var succeeded = false;
     try {
       if (hasSmpService) {
         await _performMcumgrUpdate(deviceId, zipPath);
       } else {
         await _performLegacyDfu(deviceId, zipPath);
       }
+      // Both paths only reach here without throwing when the DFU
+      // completed (they complete/completeError on the state stream).
+      succeeded = installProgress.value >= 100 || error.value == null;
     } catch (e) {
       error.value = 'インストールエラー: $e';
       debugPrint('[FW] DFU error: $e');
     } finally {
       isInstalling.value = false;
+      if (succeeded && error.value == null) {
+        installComplete.value = true;
+        // The downloaded zip has served its purpose; clear it so the
+        // install button can't be pressed again for the same image.
+        downloadedZipPath = null;
+        debugPrint('[FW] install complete');
+      }
       notifyListeners();
     }
   }
@@ -414,6 +438,7 @@ class FirmwareService extends ChangeNotifier {
     isChecking.value = false;
     isDownloading.value = false;
     isInstalling.value = false;
+    installComplete.value = false;
     notifyListeners();
   }
 
@@ -425,6 +450,7 @@ class FirmwareService extends ChangeNotifier {
     downloadProgress.dispose();
     installProgress.dispose();
     error.dispose();
+    installComplete.dispose();
     super.dispose();
   }
 }
