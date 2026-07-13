@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import 'omi_device_service.dart';
+import 'ring_protocol.dart';
 import 'sdcard_protocol.dart';
 import 'wal_store.dart';
 
@@ -332,6 +333,18 @@ class SDCardSyncService extends ChangeNotifier {
     notifyListeners();
 
     try {
+      // Firmware 3.0.20+ replaced the multi-file LittleFS store with a
+      // raw ring buffer (omi PR #7216). It is ACK-based and cannot
+      // wedge like the full-card LittleFS did — rescue mode is
+      // meaningless there, so route straight to the ring path.
+      if (_isRingFirmware(device.firmwareVersion.value)) {
+        _log('ring firmware (${device.firmwareVersion.value}) — ring sync');
+        await device.stopStorageSync();
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        await _syncRing();
+        return;
+      }
+
       if (rescue) {
         _log('=== RESCUE MODE: pausing live audio ===');
         await device.pauseAudioNotifications();
@@ -416,6 +429,219 @@ class SDCardSyncService extends ChangeNotifier {
       notifyListeners();
     }
   }
+
+  /// True for firmware 3.0.20+ (ring-buffer storage). Unparseable or
+  /// empty versions default to false (multi-file path).
+  static bool _isRingFirmware(String version) {
+    final m = RegExp(r'(\d+)\.(\d+)\.(\d+)').firstMatch(version);
+    if (m == null) return false;
+    final major = int.parse(m.group(1)!);
+    final minor = int.parse(m.group(2)!);
+    final patch = int.parse(m.group(3)!);
+    if (major != 3) return major > 3;
+    if (minor != 0) return minor > 0;
+    return patch >= 20;
+  }
+
+  /// Ring-buffer sync (firmware 3.0.20+). The ring is a single logical
+  /// stream, not files. Read from the consumer sequence, reassemble
+  /// 444-byte records, and only ADVANCE the ring (which discards data)
+  /// after the audio is safely uploaded — a BLE drop just leaves the
+  /// ring untouched and the next sync resumes from the same read_seq.
+  Future<void> _syncRing() async {
+    final status = await device.getRingStatus();
+    _log('ring status: $status');
+    if (status == null) {
+      lastError.value = 'リングステータスを取得できませんでした';
+      return;
+    }
+    if (status.unreadPackets <= 0) {
+      totalBytesOnCard = 0;
+      _log('ring empty — nothing to sync');
+      return;
+    }
+
+    final info = await device.getRingInfo();
+    if (info == null) {
+      lastError.value = 'リング情報を取得できませんでした';
+      return;
+    }
+    if (info.droppedPackets > 0) {
+      _log('WARNING: ring overwrote ${info.droppedPackets} packets pre-sync');
+    }
+    final unread = info.unreadPackets;
+    totalBytesOnCard = unread * RingProtocol.recordSize;
+    notifyListeners();
+    _log(
+      'ring read from seq=${info.readSeq} write=${info.writeSeq} '
+      'unread=$unread (~${totalBytesOnCard ~/ 1024}KB)',
+    );
+
+    final rtcValid = status.isRtcValid;
+    final reassembler = RingRecordReassembler();
+    final pending = <Uint8List>[]; // parsed opus frames awaiting upload
+    var recordsConsumed = 0;
+    int? firstTs;
+    var uploadFailed = false;
+    // ~6000 frames ≈ 60s of audio per chunk.
+    const chunkFrames = 6000;
+
+    final completer = Completer<bool>();
+    RingDone? done;
+    var firstDataReceived = false;
+    Timer? firstDataTimer;
+
+    // Flush accumulated frames to the disk WAL (bounded memory + crash
+    // safety). WAL segments upload through the same /sdcard/upload
+    // endpoint. Returns false if a segment could not be secured.
+    Future<bool> flush({required bool finalFlush}) async {
+      while (pending.length >= chunkFrames ||
+          (finalFlush && pending.isNotEmpty)) {
+        final take = pending.length >= chunkFrames
+            ? chunkFrames
+            : pending.length;
+        final chunk = pending.sublist(0, take);
+        pending.removeRange(0, take);
+        final ts = firstTs ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        final ok = await _uploadOrSpill(chunk, ts);
+        if (!ok) return false;
+        transferredBytes.value = transferredBytes.value + take;
+        if (finalFlush && pending.isEmpty) break;
+      }
+      return true;
+    }
+
+    _storageSub = device.storageStream.listen((value) async {
+      if (_cancelled || completer.isCompleted || value.isEmpty) return;
+      final opcode = value[0];
+
+      if (opcode == RingProtocol.notifyReadBegin) {
+        firstDataReceived = true;
+        firstDataTimer?.cancel();
+        return;
+      }
+      if (opcode == RingProtocol.notifyDone) {
+        done = RingProtocol.parseDoneNotification(value);
+        _log('ring DONE status=${done?.status} next=${done?.nextSeq}');
+        if (!completer.isCompleted) completer.complete(done?.isOk ?? false);
+        return;
+      }
+      if (opcode != RingProtocol.notifyData) return; // ACK/INFO/unknown
+
+      firstDataReceived = true;
+      firstDataTimer?.cancel();
+      reassembler.append(value.sublist(1));
+
+      for (final record in reassembler.drainRecords()) {
+        final ts = RingProtocol.readRecordTimestamp(record);
+        firstTs ??= (rtcValid && ts >= sdMinPlausibleEpoch)
+            ? ts
+            : DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        pending.addAll(
+          RingProtocol.parseAudioPayload(
+            record.sublist(RingProtocol.timestampBytes),
+          ),
+        );
+        recordsConsumed++;
+      }
+
+      if (totalBytesOnCard > 0) {
+        progress.value =
+            (recordsConsumed * RingProtocol.recordSize / totalBytesOnCard)
+                .clamp(0.0, 0.99);
+        notifyListeners();
+      }
+
+      // Flush full chunks as they accumulate — one flush in flight.
+      if (!_flushInFlight && pending.length >= chunkFrames) {
+        _flushInFlight = true;
+        flush(finalFlush: false)
+            .then((ok) {
+              if (!ok) {
+                uploadFailed = true;
+                if (!completer.isCompleted) completer.complete(false);
+              }
+            })
+            .whenComplete(() => _flushInFlight = false);
+      }
+    });
+
+    firstDataTimer = Timer(const Duration(seconds: 5), () {
+      if (!firstDataReceived && !completer.isCompleted) {
+        completer.completeError(
+          TimeoutException('No ring data within 5s of CMD_RING_READ'),
+        );
+      }
+    });
+
+    void onBleState() {
+      if (device.connectionState.value == OmiConnectionState.disconnected &&
+          !completer.isCompleted) {
+        completer.completeError(StateError('BLE disconnected'));
+      }
+    }
+
+    device.connectionState.addListener(onBleState);
+
+    var reachedDone = false;
+    try {
+      await device.readRingFromSeq(info.readSeq);
+      reachedDone = await completer.future.timeout(const Duration(minutes: 30));
+    } on TimeoutException catch (e) {
+      _log('ring transfer stopped: ${e.message}');
+    } catch (e) {
+      _log('ring transfer error: $e');
+    } finally {
+      firstDataTimer.cancel();
+      device.connectionState.removeListener(onBleState);
+      // Wait for any in-flight flush to settle before the tail flush.
+      while (_flushInFlight) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      await _storageSub?.cancel();
+      _storageSub = null;
+    }
+
+    // Secure whatever we received, even on partial failure — those
+    // frames are safe to keep regardless of ADVANCE.
+    final tailOk = await flush(finalFlush: true);
+    if (!tailOk) uploadFailed = true;
+
+    // ADVANCE (discards ring data) ONLY when the whole range completed
+    // AND every frame is secured. Otherwise leave the ring untouched;
+    // the next sync resumes from the same read_seq.
+    final canAdvance =
+        reachedDone &&
+        (done?.isOk ?? false) &&
+        !uploadFailed &&
+        !_cancelled &&
+        done?.nextSeq != null;
+    if (canAdvance) {
+      final ok = await device.advanceRing(done!.nextSeq);
+      _log(
+        'ring advance seq=${done!.nextSeq} -> $ok '
+        '(records=$recordsConsumed)',
+      );
+      if (ok) {
+        totalBytesOnCard = 0;
+        progress.value = 1.0;
+        notifyListeners();
+      }
+    } else {
+      _log(
+        'ring NOT advanced (done=$reachedDone ok=${done?.isOk} '
+        'uploadFailed=$uploadFailed cancelled=$_cancelled) — '
+        'will resume next sync',
+      );
+      if (uploadFailed) {
+        lastError.value =
+            '一部の音声をアップロードできませんでした。'
+            '次回の同期で続きから再開します';
+      }
+    }
+  }
+
+  bool _flushInFlight = false;
 
   /// New multi-file protocol, built around what fw 3.0.17 actually
   /// does (verified against Omi_CV1_v3.0.17 firmware source):

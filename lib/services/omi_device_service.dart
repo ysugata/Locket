@@ -6,6 +6,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/omi_discovered_device.dart';
+import 'ring_protocol.dart';
 
 // Omi BLE UUIDs
 final _audioServiceGuid = Guid('19b10000-e8f2-537e-4f6c-d104768a1214');
@@ -458,6 +459,143 @@ class OmiDeviceService extends ChangeNotifier {
     final ch = _storageDataChar;
     if (ch == null) return;
     await ch.write([0x03]);
+  }
+
+  // ---- Ring-buffer storage protocol (firmware 3.0.20+) --------------
+
+  /// Read the 16-byte ring status from the read-control characteristic
+  /// (30295782): [used_bytes][unread_packets][free_bytes][rtc_valid],
+  /// four little-endian u32. Returns null when unavailable.
+  Future<RingStatus?> getRingStatus() async {
+    final ch = _storageReadCtrlChar;
+    if (ch == null) return null;
+    try {
+      final raw = await ch.read();
+      final status = RingProtocol.parseStatus(raw);
+      debugPrint('[BLE] ring status: $status');
+      return status;
+    } catch (e) {
+      debugPrint('[BLE] getRingStatus failed: $e');
+      return null;
+    }
+  }
+
+  /// Send CMD_RING_INFO (0x10) and await the NOTIFY_INFO (0x02) reply.
+  Future<RingInfo?> getRingInfo() async {
+    final ch = _storageDataChar;
+    if (ch == null) return null;
+
+    final completer = Completer<RingInfo?>();
+    StreamSubscription<List<int>>? sub;
+    Timer? timeout;
+
+    sub = storageStream.listen((value) {
+      if (completer.isCompleted) return;
+      if (value.isNotEmpty && value[0] == RingProtocol.notifyInfo) {
+        final info = RingProtocol.parseInfoNotification(value);
+        if (info != null) {
+          sub?.cancel();
+          timeout?.cancel();
+          completer.complete(info);
+        }
+      }
+    });
+    timeout = Timer(const Duration(seconds: 10), () {
+      sub?.cancel();
+      if (!completer.isCompleted) completer.complete(null);
+    });
+
+    try {
+      await ch.write([RingProtocol.cmdInfo]);
+      final info = await completer.future;
+      debugPrint('[BLE] ring info: $info');
+      return info;
+    } finally {
+      await sub.cancel();
+      timeout.cancel();
+    }
+  }
+
+  /// Send CMD_RING_READ from [startSeq]. Data arrives on [storageStream]
+  /// as NOTIFY_READ_BEGIN / NOTIFY_DATA / NOTIFY_DONE — listen first.
+  Future<void> readRingFromSeq(int startSeq, {int? packetCount}) async {
+    final ch = _storageDataChar;
+    if (ch == null) {
+      throw StateError('Storage data characteristic not available');
+    }
+    final cmd = RingProtocol.encodeReadCommand(
+      startSeq,
+      packetCount: packetCount,
+    );
+    await ch.write(cmd);
+    debugPrint('[BLE] CMD_RING_READ seq=$startSeq count=$packetCount');
+  }
+
+  /// Send CMD_RING_ADVANCE to persist the consumer read pointer, freeing
+  /// consumed packets. Await the ACK (0x00 = success). This is the ONLY
+  /// operation that discards ring data — send it only after the audio is
+  /// safely uploaded/persisted.
+  Future<bool> advanceRing(int newReadSeq) async {
+    final ch = _storageDataChar;
+    if (ch == null) return false;
+
+    final completer = Completer<bool>();
+    StreamSubscription<List<int>>? sub;
+    Timer? timeout;
+
+    sub = storageStream.listen((value) {
+      if (completer.isCompleted) return;
+      if (value.length >= 2 && value[0] == RingProtocol.notifyAck) {
+        sub?.cancel();
+        timeout?.cancel();
+        completer.complete(value[1] == 0x00);
+      }
+    });
+    timeout = Timer(const Duration(seconds: 10), () {
+      sub?.cancel();
+      if (!completer.isCompleted) completer.complete(false);
+    });
+
+    try {
+      await ch.write(RingProtocol.encodeAdvanceCommand(newReadSeq));
+      final ok = await completer.future;
+      debugPrint('[BLE] ring advance seq=$newReadSeq -> $ok');
+      return ok;
+    } finally {
+      await sub.cancel();
+      timeout.cancel();
+    }
+  }
+
+  /// Send CMD_RING_CLEAR (0x13) — discards all ring data. Awaits ACK.
+  Future<bool> clearRing() async {
+    final ch = _storageDataChar;
+    if (ch == null) return false;
+
+    final completer = Completer<bool>();
+    StreamSubscription<List<int>>? sub;
+    Timer? timeout;
+
+    sub = storageStream.listen((value) {
+      if (completer.isCompleted) return;
+      if (value.length >= 2 && value[0] == RingProtocol.notifyAck) {
+        sub?.cancel();
+        timeout?.cancel();
+        completer.complete(value[1] == 0x00);
+      }
+    });
+    timeout = Timer(const Duration(seconds: 10), () {
+      sub?.cancel();
+      if (!completer.isCompleted) completer.complete(false);
+    });
+
+    try {
+      await ch.write([RingProtocol.cmdClear]);
+      return await completer.future;
+    } finally {
+      await sub.cancel();
+      timeout.cancel();
+    }
   }
 
   /// Send CMD_READ_FILE (0x11) — new multi-file protocol.
