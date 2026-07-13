@@ -584,6 +584,28 @@ class _SDCardSection extends StatelessWidget {
   }
 
   Future<void> _confirmRescue(BuildContext context) async {
+    // A near-empty card needs no rescue — say so instead of offering
+    // a destructive flow that has nothing to recover.
+    final sdBytes = app.sdCardSync?.totalBytesOnCard ?? -1;
+    if (sdBytes >= 0 && sdBytes < 1024 * 1024) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('レスキュー同期'),
+          content: Text(
+            'SDカードはほぼ空です（${sdBytes}B）。\n'
+            'レスキューは不要で、同期するデータもありません。',
+          ),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('閉じる'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
