@@ -300,7 +300,7 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
   Future<void> _install() async {
     final fw = _fw;
     final zipPath = fw?.downloadedZipPath;
-    if (fw == null || zipPath == null) return;
+    if (fw == null || zipPath == null || !fw.canInstall) return;
     final deviceId = widget.app.settings.pairedBleId;
     if (deviceId == null) return;
 
@@ -338,11 +338,17 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
     // Disable auto-reconnect during DFU — disconnect is expected.
     widget.app.device.enableAutoReconnect(false);
 
-    await fw.performUpdate(
-      deviceId,
-      zipPath,
-      hasSmpService: widget.app.device.hasSmpService.value,
-    );
+    try {
+      await fw.performUpdate(
+        deviceId,
+        zipPath,
+        hasSmpService: widget.app.device.hasSmpService.value,
+      );
+    } finally {
+      // Restore auto-reconnect so the device links back up after it
+      // reboots into the new firmware.
+      widget.app.device.enableAutoReconnect(widget.app.settings.autoReconnect);
+    }
     if (mounted) setState(() {});
   }
 
@@ -392,6 +398,7 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
         fw.isChecking,
         fw.isDownloading,
         fw.isInstalling,
+        fw.installComplete,
         fw.downloadProgress,
         fw.installProgress,
         fw.error,
@@ -400,10 +407,15 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
         final checking = fw.isChecking.value;
         final downloading = fw.isDownloading.value;
         final installing = fw.isInstalling.value;
+        final complete = fw.installComplete.value;
         final dlProgress = fw.downloadProgress.value;
         final instProgress = fw.installProgress.value;
         final errorMsg = fw.error.value;
         final latest = fw.latestInfo;
+        final onLatest =
+            latest != null &&
+            currentVersion.isNotEmpty &&
+            currentVersion == latest.version;
 
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -414,7 +426,24 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
             ),
             if (latest != null) ...[
               const SizedBox(height: 8),
-              Text('最新バージョン: ${latest.version}'),
+              Row(
+                children: [
+                  Expanded(child: Text('最新バージョン: ${latest.version}')),
+                  if (onLatest)
+                    Row(
+                      children: [
+                        Icon(Icons.check_circle, size: 16, color: Colors.green),
+                        const SizedBox(width: 4),
+                        Text(
+                          '最新です',
+                          style: Theme.of(
+                            context,
+                          ).textTheme.bodySmall?.copyWith(color: Colors.green),
+                        ),
+                      ],
+                    ),
+                ],
+              ),
               if (latest.releaseNotes != null &&
                   latest.releaseNotes!.isNotEmpty) ...[
                 const SizedBox(height: 4),
@@ -425,6 +454,22 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
                   overflow: TextOverflow.ellipsis,
                 ),
               ],
+            ],
+            if (complete && !installing) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Icon(Icons.check_circle, size: 18, color: Colors.green),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      'インストール完了。デバイスが再起動して新しい'
+                      'ファームウェアで接続し直します',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ),
+                ],
+              ),
             ],
             if (errorMsg != null) ...[
               const SizedBox(height: 8),
@@ -452,7 +497,8 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
               LinearProgressIndicator(value: instProgress / 100),
               const SizedBox(height: 4),
               Text(
-                'インストール中... $instProgress%',
+                'インストール中... $instProgress%'
+                '（完了までアプリを閉じず、デバイスを近くに置いてください）',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ],
@@ -473,7 +519,11 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
                         : const Icon(Icons.refresh),
                     label: const Text('アップデートを確認'),
                   ),
+                // Download only when there's a genuinely newer version
+                // and nothing is downloaded/in-flight yet.
                 if (latest != null &&
+                    !onLatest &&
+                    !complete &&
                     !fw.hasDownloadedFirmware &&
                     !downloading &&
                     !installing)
@@ -482,7 +532,9 @@ class _FirmwareSectionState extends State<_FirmwareSection> {
                     icon: const Icon(Icons.download),
                     label: const Text('ダウンロード'),
                   ),
-                if (fw.hasDownloadedFirmware && !installing && !downloading)
+                // Install only while a fresh download is ready and the
+                // device isn't already on that version.
+                if (fw.canInstall && !onLatest)
                   FilledButton.icon(
                     onPressed: _install,
                     icon: const Icon(Icons.system_update),
